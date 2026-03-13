@@ -1,0 +1,581 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi-Prompt Rollback Viewer</title>
+<style>
+  :root {
+    --bg: #0e0e1a; --bg2: #151528; --bg3: #1c1c36; --bg4: #24244a;
+    --border: #2a2a4a; --text: #e0e0f0; --text2: #999; --accent: #7ecfff;
+    --accent2: #c8a8ff; --accent3: #ff9966; --green: #8fca8f;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); display: flex; height: 100vh; overflow: hidden; }
+
+  /* ─── SIDEBAR ─── */
+  .sidebar {
+    width: 300px; min-width: 300px; background: var(--bg2); border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .sidebar-header {
+    padding: 16px; border-bottom: 1px solid var(--border);
+  }
+  .sidebar-header h1 { font-size: 1.1rem; color: var(--accent); margin-bottom: 4px; }
+  .sidebar-header .stats { font-size: 0.75rem; color: var(--text2); }
+  .sidebar-search {
+    padding: 8px 12px; border-bottom: 1px solid var(--border);
+  }
+  .sidebar-search input {
+    width: 100%; padding: 7px 10px; border-radius: 5px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 0.82rem;
+  }
+  .prompt-list {
+    flex: 1; overflow-y: auto; padding: 6px 0;
+  }
+  .prompt-list::-webkit-scrollbar { width: 6px; }
+  .prompt-list::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .prompt-item {
+    padding: 10px 14px; cursor: pointer; border-left: 3px solid transparent;
+    transition: all .12s; font-size: 0.82rem; line-height: 1.4;
+  }
+  .prompt-item:hover { background: var(--bg3); }
+  .prompt-item.active { background: var(--bg4); border-left-color: var(--accent); }
+  .prompt-item .p-num { color: var(--accent); font-weight: 700; font-size: 0.72rem; }
+  .prompt-item .p-label { color: var(--accent3); font-weight: 600; margin-left: 4px; }
+  .prompt-item .p-text { display: block; color: var(--text2); font-size: 0.76rem; margin-top: 3px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .prompt-item .p-render { display: inline-block; background: #2d2d5a; color: var(--accent2);
+    font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; margin-top: 3px; }
+
+  /* ─── MAIN ─── */
+  .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* ─── TOP BAR ─── */
+  .topbar {
+    padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--bg2);
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .topbar .mode-tabs { display: flex; gap: 4px; }
+  .topbar .mode-tabs button {
+    padding: 5px 14px; border-radius: 5px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text2); font-size: 0.8rem; cursor: pointer; transition: .12s;
+  }
+  .topbar .mode-tabs button.active { background: var(--bg4); color: #fff; border-color: var(--accent); }
+  .topbar .mode-tabs button:hover { border-color: var(--accent); }
+  .topbar .ctrl { display: flex; align-items: center; gap: 6px; }
+  .topbar .ctrl label { color: var(--text2); font-size: 0.78rem; }
+  .topbar .ctrl input[type=range] { width: 120px; accent-color: var(--accent); }
+  .topbar .ctrl span { color: var(--text2); font-size: 0.78rem; min-width: 36px; }
+  .topbar .ctrl select {
+    padding: 4px 8px; border-radius: 4px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--text); font-size: 0.8rem;
+  }
+  .topbar .prompt-info-bar {
+    flex: 1; min-width: 200px;
+  }
+  .topbar .prompt-info-bar .pi-title { color: var(--accent3); font-weight: 600; font-size: 0.9rem; }
+  .topbar .prompt-info-bar .pi-prompt { color: var(--text2); font-size: 0.78rem; margin-top: 2px; }
+
+  /* ─── CONTENT AREA ─── */
+  .content { flex: 1; overflow: auto; padding: 16px 20px; }
+  .content::-webkit-scrollbar { width: 8px; height: 8px; }
+  .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  /* ─── Matrix view ─── */
+  table.matrix { border-collapse: collapse; }
+  table.matrix th, table.matrix td { border: 1px solid var(--border); text-align: center; vertical-align: middle; }
+  table.matrix thead th {
+    background: var(--bg3); color: #aac; padding: 8px 10px; font-size: 0.82rem;
+    position: sticky; top: 0; z-index: 3;
+  }
+  table.matrix thead th.corner { z-index: 4; }
+  table.matrix tbody th {
+    background: var(--bg2); color: #cce; padding: 6px 12px; font-size: 0.78rem;
+    white-space: nowrap; text-align: left; position: sticky; left: 0; z-index: 2;
+    min-width: 200px;
+  }
+  table.matrix tbody td { padding: 3px; background: var(--bg); }
+  table.matrix tbody td img {
+    display: block; margin: 0 auto; border-radius: 4px; cursor: pointer;
+    transition: transform .12s, box-shadow .12s; object-fit: cover;
+  }
+  table.matrix tbody td img:hover {
+    transform: scale(1.06); box-shadow: 0 0 10px rgba(126,207,255,.45); z-index: 1; position: relative;
+  }
+  table.matrix tbody td.empty { color: #444; font-size: 0.7rem; }
+
+  /* row group header */
+  .matrix-group-header td {
+    background: var(--bg3) !important; text-align: left !important; padding: 8px 14px !important;
+    font-weight: 600; font-size: 0.85rem; color: var(--accent2); border: 1px solid var(--border);
+  }
+
+  /* ─── Cross-prompt view (horizontal scroll) ─── */
+  .cross-grid {
+    display: flex; flex-direction: column; gap: 24px;
+  }
+  .cross-section-title {
+    font-size: 0.95rem; color: var(--accent2); padding: 6px 12px;
+    background: var(--bg3); border-radius: 6px; display: inline-block; margin-bottom: 6px;
+  }
+  .cross-row-wrap { overflow-x: auto; padding-bottom: 8px; }
+  .cross-row-wrap::-webkit-scrollbar { height: 6px; }
+  .cross-row-wrap::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  /* ─── Badges ─── */
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.72rem; font-weight: 700; margin-right: 2px; }
+  .badge-s { background: #2d4a6a; color: #8cc8ff; }
+  .badge-rb { background: #3a2d5a; color: #c8a8ff; }
+  .badge-gap { background: #2a3a2a; color: var(--green); font-weight: 400; font-size: 0.68rem; }
+  .badge-x { background: #5a3a2a; color: #ffb888; }
+  .badge-type { font-weight: 400; font-size: 0.68rem; }
+  .badge-single { background: #1a3a4a; color: #88ccee; }
+  .badge-dual { background: #3a2a4a; color: #bb99ee; }
+  .badge-triple { background: #4a2a2a; color: #ee9988; }
+  .arrow { color: var(--accent3); font-weight: 700; margin: 0 1px; }
+  .plus { color: #aaa; margin: 0 3px; }
+
+  /* ─── Lightbox ─── */
+  .lightbox {
+    display: none; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+    background: rgba(0,0,0,.94); z-index: 9999; justify-content: center; align-items: center;
+    flex-direction: column; cursor: zoom-out;
+  }
+  .lightbox.active { display: flex; }
+  .lightbox img { max-width: 88vw; max-height: 75vh; border-radius: 8px; }
+  .lightbox .lb-info { color: #ccc; margin-top: 16px; font-size: 0.95rem; text-align: center; line-height: 1.6; max-width: 80vw; }
+  .lightbox .lb-nav {
+    position: absolute; top: 50%; transform: translateY(-50%); font-size: 2.5rem;
+    color: #fff; cursor: pointer; user-select: none; padding: 10px 18px; opacity: 0.6; transition: .15s;
+  }
+  .lightbox .lb-nav:hover { opacity: 1; }
+  .lightbox .lb-nav.prev { left: 12px; }
+  .lightbox .lb-nav.next { right: 12px; }
+  .lightbox .lb-close { position: absolute; top: 14px; right: 24px; font-size: 2rem; color: #fff; cursor: pointer; opacity: .7; }
+  .lightbox .lb-close:hover { opacity: 1; }
+  .lightbox .lb-seed-row { display: flex; gap: 6px; margin-top: 12px; }
+  .lightbox .lb-seed-row img {
+    width: 72px; height: 72px; object-fit: cover; border-radius: 4px; cursor: pointer;
+    border: 2px solid transparent; transition: .12s;
+  }
+  .lightbox .lb-seed-row img:hover { border-color: var(--accent); }
+  .lightbox .lb-seed-row img.active { border-color: var(--accent3); }
+
+  .hidden { display: none !important; }
+
+  /* ─── Overview thumbnail grid ─── */
+  .overview-grid { display: flex; flex-wrap: wrap; gap: 20px; }
+  .overview-card {
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px; width: 280px; cursor: pointer; transition: .12s;
+  }
+  .overview-card:hover { border-color: var(--accent); transform: translateY(-2px); }
+  .overview-card .oc-img { width: 100%; aspect-ratio: 1; object-fit: cover; border-radius: 5px; }
+  .overview-card .oc-num { color: var(--accent); font-weight: 700; font-size: 0.75rem; }
+  .overview-card .oc-label { color: var(--accent3); font-weight: 600; font-size: 0.85rem; margin-left: 4px; }
+  .overview-card .oc-prompt { color: var(--text2); font-size: 0.74rem; margin-top: 4px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+  .overview-card .oc-render { display: inline-block; background: #2d2d5a; color: var(--accent2);
+    font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<!-- ═══ SIDEBAR ═══ -->
+<div class="sidebar">
+  <div class="sidebar-header">
+    <h1>🔤 Multi-Prompt Viewer</h1>
+    <div class="stats">30 prompts × 15 settings × 5 seeds = 2,250 images</div>
+  </div>
+  <div class="sidebar-search">
+    <input type="text" id="sidebarSearch" placeholder="🔍 搜尋 prompt…">
+  </div>
+  <div class="prompt-list" id="promptList"></div>
+</div>
+
+<!-- ═══ MAIN ═══ -->
+<div class="main">
+  <div class="topbar">
+    <div class="mode-tabs">
+      <button class="active" data-mode="single">📋 Single Prompt</button>
+      <button data-mode="cross">🔀 Cross-Prompt Compare</button>
+      <button data-mode="overview">🖼️ Overview</button>
+    </div>
+    <div class="ctrl">
+      <label>Size:</label>
+      <input type="range" id="sizeSlider" min="64" max="280" value="140" step="8">
+      <span id="sizeLabel">140px</span>
+    </div>
+    <div class="ctrl" id="seedCtrl">
+      <label>Seed:</label>
+      <select id="seedSelect">
+        <option value="0">All Seeds</option>
+        <option value="1">Seed 1</option>
+        <option value="2">Seed 2</option>
+        <option value="3">Seed 3</option>
+        <option value="4">Seed 4</option>
+        <option value="5">Seed 5</option>
+      </select>
+    </div>
+    <div class="prompt-info-bar" id="promptInfoBar">
+      <div class="pi-title" id="piTitle">— Select a prompt —</div>
+      <div class="pi-prompt" id="piPrompt"></div>
+    </div>
+  </div>
+  <div class="content" id="contentArea"></div>
+</div>
+
+<!-- ═══ LIGHTBOX ═══ -->
+<div class="lightbox" id="lightbox">
+  <span class="lb-close" id="lbClose">&times;</span>
+  <span class="lb-nav prev" id="lbPrev">‹</span>
+  <span class="lb-nav next" id="lbNext">›</span>
+  <img id="lbImg" src="">
+  <div class="lb-info" id="lbInfo"></div>
+  <div class="lb-seed-row" id="lbSeedRow"></div>
+</div>
+
+<script>
+/* ══════════════════════════════════════════
+   DATA
+   ══════════════════════════════════════════ */
+const IMG_ROOT = '../outputs/outputs_loop_exp/multi_prompt_test/';
+
+const PROMPTS = [
+  {i:1, dir:"prompt_001_OPEN", label:"OPEN", prompt:"A neon sign that reads \"OPEN\" above a rainy street at night.", texts:["OPEN"]},
+  {i:2, dir:"prompt_002_LATTE", label:"LATTE", prompt:"A cozy coffee shop chalkboard menu that says \"LATTE\" in handwritten letters.", texts:["LATTE"]},
+  {i:3, dir:"prompt_003_NEXT_STOP", label:"NEXT STOP", prompt:"A subway platform poster with bold text: \"NEXT STOP\"", texts:["NEXT STOP"]},
+  {i:4, dir:"prompt_004_SUMMER_SALE", label:"SUMMER SALE", prompt:"A roadside billboard in bright daylight that reads \"SUMMER SALE\"", texts:["SUMMER SALE"]},
+  {i:5, dir:"prompt_005_MEETING_ROOM", label:"MEETING ROOM", prompt:"A modern office door plaque that says \"MEETING ROOM\".", texts:["MEETING ROOM"]},
+  {i:6, dir:"prompt_006_TODAYS_SPECIAL", label:"TODAY'S SPECIAL", prompt:"A cafe chalkboard menu that reads \"TODAY'S SPECIAL\" beside a pastry display.", texts:["TODAY'S SPECIAL"]},
+  {i:7, dir:"prompt_007_NEXT_TRAIN", label:"NEXT TRAIN", prompt:"A subway station LED board that reads \"NEXT TRAIN\" above a crowded platform.", texts:["NEXT TRAIN"]},
+  {i:8, dir:"prompt_008_VACANCY", label:"VACANCY", prompt:"A roadside motel marquee that reads \"VACANCY\" under a desert sunset.", texts:["VACANCY"]},
+  {i:9, dir:"prompt_009_NEW_ARRIVALS", label:"NEW ARRIVALS", prompt:"A bookstore window poster that reads \"NEW ARRIVALS\" surrounded by stacked novels.", texts:["NEW ARRIVALS"]},
+  {i:10, dir:"prompt_010_SOLD_OUT", label:"SOLD OUT", prompt:"A concert venue entrance sign that reads \"SOLD OUT\" under bright spotlights.", texts:["SOLD OUT"]},
+  {i:11, dir:"prompt_011_24_HOURS", label:"24 HOURS", prompt:"A convenience store lightbox sign that reads \"24 HOURS\" glowing on a quiet corner at dawn.", texts:["24 HOURS"]},
+  {i:12, dir:"prompt_012_BOARDING", label:"BOARDING", prompt:"An airport gate display that reads \"BOARDING\" above passengers lining up with carry-ons.", texts:["BOARDING"]},
+  {i:13, dir:"prompt_013_HOT_NOODLES", label:"HOT NOODLES", prompt:"A street food stall banner that reads \"HOT NOODLES\" beside steaming pots at night.", texts:["HOT NOODLES"]},
+  {i:14, dir:"prompt_014_DO_NOT_TOUCH", label:"DO NOT TOUCH", prompt:"A museum wall placard that reads \"DO NOT TOUCH\" next to a glass exhibit case.", texts:["DO NOT TOUCH"]},
+  {i:15, dir:"prompt_015_FRESH_BREAD", label:"FRESH BREAD", prompt:"A bakery window neon that reads \"FRESH BREAD\" with warm light spilling onto the sidewalk.", texts:["FRESH BREAD"]},
+  {i:16, dir:"prompt_016_CLUB_FAIR", label:"CLUB FAIR", prompt:"A campus bulletin board flyer that reads \"CLUB FAIR\" pinned among colorful notices.", texts:["CLUB FAIR"]},
+  {i:17, dir:"prompt_017_EMERGENCY", label:"EMERGENCY", prompt:"A hospital hallway sign that reads \"EMERGENCY\" above automatic sliding doors.", texts:["EMERGENCY"]},
+  {i:18, dir:"prompt_018_NOW_SHOWING", label:"NOW SHOWING", prompt:"A vintage cinema marquee that reads \"NOW SHOWING\" lit by rows of bulbs at dusk.", texts:["NOW SHOWING"]},
+  {i:19, dir:"prompt_019_KEEP_OUT", label:"KEEP OUT", prompt:"A construction site warning sign that reads \"KEEP OUT\" on a chain-link fence.", texts:["KEEP OUT"]},
+  {i:20, dir:"prompt_020_WASH_DRY", label:"WASH & DRY", prompt:"A laundromat digital display that reads \"WASH & DRY\" above humming machines.", texts:["WASH & DRY"]},
+  {i:21, dir:"prompt_021_WELCOME_TO_THE_CITY", label:"WELCOME TO THE CITY", prompt:"A rooftop billboard that reads \"WELCOME TO THE CITY\" above glowing skyscrapers at night.", texts:["WELCOME TO THE CITY"]},
+  {i:22, dir:"prompt_022_FRESH_COFFEE_SERVED_DAILY", label:"FRESH COFFEE SERVED DAILY", prompt:"A cafe window decal that reads \"FRESH COFFEE SERVED DAILY\" with morning sunlight inside.", texts:["FRESH COFFEE SERVED DAILY"]},
+  {i:23, dir:"prompt_023_PLEASE_STAND_BEHIND_LINE", label:"PLEASE STAND BEHIND LINE", prompt:"A train platform sign that reads \"PLEASE STAND BEHIND LINE\" as a train approaches.", texts:["PLEASE STAND BEHIND LINE"]},
+  {i:24, dir:"prompt_024_BUY_ONE_GET_ONE", label:"BUY ONE GET ONE", prompt:"A supermarket aisle banner that reads \"BUY ONE GET ONE\" hanging over a busy checkout.", texts:["BUY ONE GET ONE"]},
+  {i:25, dir:"prompt_025_KEEP_YOUR_DOG_LEASHED", label:"KEEP YOUR DOG LEASHED", prompt:"A park entrance sign that reads \"KEEP YOUR DOG LEASHED\" beside a winding path.", texts:["KEEP YOUR DOG LEASHED"]},
+  {i:26, dir:"prompt_026_FRESH_COFFEE_DAILY", label:"FRESH COFFEE DAILY", prompt:"Render the text \"FRESH COFFEE DAILY\" in the image of a sunlit cafe counter with cups and pastries.", texts:["FRESH COFFEE DAILY"]},
+  {i:27, dir:"prompt_027_PLEASE_WAIT_HERE", label:"PLEASE WAIT HERE", prompt:"The words \"PLEASE WAIT HERE\" are shown on a floor sticker in an image of a modern clinic lobby.", texts:["PLEASE WAIT HERE"]},
+  {i:28, dir:"prompt_028_LIMITED_TIME_OFFER", label:"LIMITED TIME OFFER", prompt:"\"LIMITED TIME OFFER\" is shown on a hanging banner in an image of a busy street market at night.", texts:["LIMITED TIME OFFER"]},
+  {i:29, dir:"prompt_029_WELCOME_TO_OUR_STORE", label:"WELCOME TO OUR STORE", prompt:"Render the text \"WELCOME TO OUR STORE\" in the image of a glass storefront entrance with reflections.", texts:["WELCOME TO OUR STORE"]},
+  {i:30, dir:"prompt_030_PICK_UP_HERE", label:"PICK UP HERE", prompt:"The phrases \"PICK UP HERE\" and \"DROP OFF THERE\" are shown on two signs in an image of a laundromat aisle.", texts:["PICK UP HERE","DROP OFF THERE"]},
+];
+
+const SETTINGS = [
+  {name:"base",       rules:[], type:"base"},
+  {name:"s3rb1x1",    rules:[{s:3,rb:1,x:1}], type:"single"},
+  {name:"s3rb1x3",    rules:[{s:3,rb:1,x:3}], type:"single"},
+  {name:"s4rb1x2",    rules:[{s:4,rb:1,x:2}], type:"single"},
+  {name:"s4rb2x1",    rules:[{s:4,rb:2,x:1}], type:"single"},
+  {name:"s4rb2x3",    rules:[{s:4,rb:2,x:3}], type:"single"},
+  {name:"s5rb2x2",    rules:[{s:5,rb:2,x:2}], type:"single"},
+  {name:"s5rb3x1",    rules:[{s:5,rb:3,x:1}], type:"single"},
+  {name:"s5rb3x3",    rules:[{s:5,rb:3,x:3}], type:"single"},
+  {name:"s6rb3x2",    rules:[{s:6,rb:3,x:2}], type:"single"},
+  {name:"s6rb4x1",    rules:[{s:6,rb:4,x:1}], type:"single"},
+  {name:"s6rb4x3",    rules:[{s:6,rb:4,x:3}], type:"single"},
+  {name:"s4rb2_s6rb4_x2",       rules:[{s:4,rb:2,x:2},{s:6,rb:4,x:2}], type:"dual"},
+  {name:"s3rb1_s5rb3_x2",       rules:[{s:3,rb:1,x:2},{s:5,rb:3,x:2}], type:"dual"},
+  {name:"s4rb2_s6rb4_s8rb6_x1", rules:[{s:4,rb:2,x:1},{s:6,rb:4,x:1},{s:8,rb:6,x:1}], type:"triple"},
+];
+
+const SEEDS = [1, 2, 3, 4, 5];
+
+/* ── Helpers ── */
+function imgPath(promptDir, setting, seed) {
+  return `${IMG_ROOT}${promptDir}/${setting}/seed_${seed}.jpg`;
+}
+
+function ruleBadgeHTML(r) {
+  return `<span class="badge badge-s">S${r.s}</span><span class="arrow">→</span><span class="badge badge-rb">${r.rb}</span><span class="badge badge-gap">gap${r.s-r.rb}</span>`;
+}
+
+function settingLabel(st) {
+  if (st.type === 'base') return '📌 <b>Base</b> <span style="color:#666;font-size:.7rem">(no rollback)</span>';
+  let h = st.rules.map(ruleBadgeHTML).join('<span class="plus">+</span>');
+  const x = st.rules[0].x;
+  h += ` <span class="badge badge-x">×${x}</span>`;
+  const typeClass = st.type === 'single' ? 'badge-single' : st.type === 'dual' ? 'badge-dual' : 'badge-triple';
+  const typeLabel = st.type === 'single' ? 'Single' : st.type === 'dual' ? 'Dual' : 'Triple';
+  h += ` <span class="badge badge-type ${typeClass}">${typeLabel}</span>`;
+  return h;
+}
+
+/* ══════════════════════════════════════════
+   SIDEBAR
+   ══════════════════════════════════════════ */
+let activePromptIdx = 0;
+
+function renderSidebar(filter = '') {
+  const el = document.getElementById('promptList');
+  const q = filter.toLowerCase();
+  el.innerHTML = PROMPTS.filter(p => !q || p.label.toLowerCase().includes(q) || p.prompt.toLowerCase().includes(q))
+    .map(p => `<div class="prompt-item ${activePromptIdx === p.i ? 'active' : ''}" data-idx="${p.i}">
+      <span class="p-num">#${String(p.i).padStart(2,'0')}</span>
+      <span class="p-label">${p.label}</span>
+      <span class="p-text">${p.prompt}</span>
+      <span class="p-render">"${p.texts.join('" "')}"</span>
+    </div>`).join('');
+  el.querySelectorAll('.prompt-item').forEach(item => {
+    item.addEventListener('click', () => {
+      activePromptIdx = parseInt(item.dataset.idx);
+      renderSidebar(document.getElementById('sidebarSearch').value);
+      render();
+    });
+  });
+}
+
+document.getElementById('sidebarSearch').addEventListener('input', e => renderSidebar(e.target.value));
+
+/* ══════════════════════════════════════════
+   MODE SWITCHING
+   ══════════════════════════════════════════ */
+let currentMode = 'single';
+
+document.querySelectorAll('.mode-tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    currentMode = btn.dataset.mode;
+    document.querySelectorAll('.mode-tabs button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    render();
+  });
+});
+
+/* ══════════════════════════════════════════
+   RENDER
+   ══════════════════════════════════════════ */
+function getSize() { return parseInt(document.getElementById('sizeSlider').value); }
+function getSelectedSeed() { return parseInt(document.getElementById('seedSelect').value); }
+
+function render() {
+  const area = document.getElementById('contentArea');
+  if (currentMode === 'single') renderSinglePrompt(area);
+  else if (currentMode === 'cross') renderCrossPrompt(area);
+  else if (currentMode === 'overview') renderOverview(area);
+  updateTopBar();
+}
+
+function updateTopBar() {
+  const bar = document.getElementById('promptInfoBar');
+  if (currentMode === 'overview') {
+    document.getElementById('piTitle').textContent = '🖼️ All 30 Prompts Overview';
+    document.getElementById('piPrompt').textContent = 'Click a card to view its full matrix.';
+  } else if (currentMode === 'cross') {
+    document.getElementById('piTitle').textContent = '🔀 Cross-Prompt Comparison';
+    document.getElementById('piPrompt').textContent = 'Same rollback setting applied to all prompts — compare text rendering quality.';
+  } else {
+    const p = PROMPTS.find(p => p.i === activePromptIdx);
+    if (p) {
+      document.getElementById('piTitle').innerHTML = `#${String(p.i).padStart(2,'0')} ${p.label} <span style="color:var(--accent2);font-size:.78rem;margin-left:6px;">"${p.texts.join('" "')}"</span>`;
+      document.getElementById('piPrompt').textContent = p.prompt;
+    } else {
+      document.getElementById('piTitle').textContent = '← Select a prompt from sidebar';
+      document.getElementById('piPrompt').textContent = '';
+    }
+  }
+}
+
+/* ─────────────────────────────────────────
+   MODE 1: Single Prompt — Matrix Table
+   ───────────────────────────────────────── */
+function renderSinglePrompt(area) {
+  const p = PROMPTS.find(p => p.i === activePromptIdx);
+  if (!p) { area.innerHTML = '<div style="padding:60px;text-align:center;color:#666;font-size:1.1rem;">← 請從左側選擇一個 prompt</div>'; return; }
+  const sz = getSize();
+  const seedFilter = getSelectedSeed();
+  const seeds = seedFilter === 0 ? SEEDS : [seedFilter];
+
+  // Group settings by type
+  const groups = [
+    { label: '📌 Base', items: SETTINGS.filter(s => s.type === 'base') },
+    { label: '🔹 Single Rule', items: SETTINGS.filter(s => s.type === 'single') },
+    { label: '🔸 Dual Rule', items: SETTINGS.filter(s => s.type === 'dual') },
+    { label: '🔻 Triple Rule', items: SETTINGS.filter(s => s.type === 'triple') },
+  ].filter(g => g.items.length > 0);
+
+  let html = `<table class="matrix"><thead><tr>
+    <th class="corner" style="min-width:240px">Rollback Setting</th>`;
+  for (const sd of seeds) html += `<th>Seed ${sd}</th>`;
+  html += `</tr></thead><tbody>`;
+
+  for (const g of groups) {
+    // Group header row
+    html += `<tr class="matrix-group-header"><td colspan="${seeds.length + 1}">${g.label}</td></tr>`;
+    for (const st of g.items) {
+      html += `<tr><th>${settingLabel(st)}</th>`;
+      for (const sd of seeds) {
+        const src = imgPath(p.dir, st.name, sd);
+        const info = `${p.label} — ${st.name} — seed ${sd}`;
+        html += `<td><img src="${src}" loading="lazy" style="width:${sz}px;height:${sz}px;"
+          onclick="openLB('${p.dir}','${st.name}',${sd})" title="${info}"></td>`;
+      }
+      html += `</tr>`;
+    }
+  }
+  html += `</tbody></table>`;
+  area.innerHTML = html;
+}
+
+/* ─────────────────────────────────────────
+   MODE 2: Cross-Prompt Comparison
+   ───────────────────────────────────────── */
+function renderCrossPrompt(area) {
+  const sz = getSize();
+  const seedFilter = getSelectedSeed();
+  const seed = seedFilter === 0 ? 1 : seedFilter;
+
+  // Group settings
+  const groups = [
+    { label: '📌 Base', items: SETTINGS.filter(s => s.type === 'base') },
+    { label: '🔹 Single Rule', items: SETTINGS.filter(s => s.type === 'single') },
+    { label: '🔸 Dual Rule', items: SETTINGS.filter(s => s.type === 'dual') },
+    { label: '🔻 Triple Rule', items: SETTINGS.filter(s => s.type === 'triple') },
+  ].filter(g => g.items.length > 0);
+
+  let html = '';
+  for (const g of groups) {
+    for (const st of g.items) {
+      html += `<div style="margin-bottom:28px;">`;
+      html += `<div class="cross-section-title">${settingLabel(st)}</div>`;
+      html += `<div style="font-size:.72rem;color:#666;margin-bottom:6px;">Showing seed ${seed} for all 30 prompts</div>`;
+      html += `<div class="cross-row-wrap"><table class="matrix"><thead><tr>`;
+      // Column headers = prompt labels
+      for (const p of PROMPTS) {
+        html += `<th style="font-size:.68rem;max-width:${sz+10}px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+          title="${p.prompt}">#${p.i} ${p.label}</th>`;
+      }
+      html += `</tr></thead><tbody><tr>`;
+      for (const p of PROMPTS) {
+        const src = imgPath(p.dir, st.name, seed);
+        html += `<td><img src="${src}" loading="lazy" style="width:${sz}px;height:${sz}px;"
+          onclick="openLB('${p.dir}','${st.name}',${seed})" title="${p.label} — ${st.name}"></td>`;
+      }
+      html += `</tr></tbody></table></div></div>`;
+    }
+  }
+  area.innerHTML = html;
+}
+
+/* ─────────────────────────────────────────
+   MODE 3: Overview
+   ───────────────────────────────────────── */
+function renderOverview(area) {
+  const sz = getSize();
+  let html = '<div class="overview-grid">';
+  for (const p of PROMPTS) {
+    const src = imgPath(p.dir, 'base', 1);
+    html += `<div class="overview-card" onclick="activePromptIdx=${p.i};currentMode='single';
+      document.querySelectorAll('.mode-tabs button').forEach(b=>b.classList.remove('active'));
+      document.querySelector('[data-mode=single]').classList.add('active');
+      renderSidebar(document.getElementById('sidebarSearch').value);render();">
+      <img class="oc-img" src="${src}" loading="lazy">
+      <div style="margin-top:6px;">
+        <span class="oc-num">#${String(p.i).padStart(2,'0')}</span>
+        <span class="oc-label">${p.label}</span>
+      </div>
+      <div class="oc-prompt">${p.prompt}</div>
+      <span class="oc-render">"${p.texts.join('" "')}"</span>
+    </div>`;
+  }
+  html += '</div>';
+  area.innerHTML = html;
+}
+
+/* ══════════════════════════════════════════
+   SIZE & SEED CONTROLS
+   ══════════════════════════════════════════ */
+document.getElementById('sizeSlider').addEventListener('input', e => {
+  document.getElementById('sizeLabel').textContent = e.target.value + 'px';
+  // Update all visible images
+  document.querySelectorAll('table.matrix tbody td img, .overview-card .oc-img').forEach(img => {
+    img.style.width = e.target.value + 'px';
+    img.style.height = e.target.value + 'px';
+  });
+  if (currentMode === 'cross' || currentMode === 'overview') render();
+});
+
+document.getElementById('seedSelect').addEventListener('change', render);
+
+/* ══════════════════════════════════════════
+   LIGHTBOX
+   ══════════════════════════════════════════ */
+let lbState = { promptDir: '', setting: '', seed: 1 };
+
+function openLB(promptDir, setting, seed) {
+  lbState = { promptDir, setting, seed };
+  const src = imgPath(promptDir, setting, seed);
+  document.getElementById('lbImg').src = src;
+
+  const p = PROMPTS.find(p => p.dir === promptDir);
+  const st = SETTINGS.find(s => s.name === setting);
+  let info = `<b>${p ? p.label : promptDir}</b> — ${setting} — seed ${seed}`;
+  if (p) info += `<br><span style="font-size:.82rem;color:#999;">${p.prompt}</span>`;
+  document.getElementById('lbInfo').innerHTML = info;
+
+  // Seed thumbnail row
+  const seedRow = document.getElementById('lbSeedRow');
+  seedRow.innerHTML = SEEDS.map(sd => {
+    const s = imgPath(promptDir, setting, sd);
+    return `<img src="${s}" class="${sd === seed ? 'active' : ''}" onclick="event.stopPropagation();switchLBSeed(${sd})">`;
+  }).join('');
+
+  document.getElementById('lightbox').classList.add('active');
+}
+
+function switchLBSeed(sd) {
+  lbState.seed = sd;
+  document.getElementById('lbImg').src = imgPath(lbState.promptDir, lbState.setting, sd);
+  document.querySelectorAll('.lb-seed-row img').forEach((img, i) => {
+    img.classList.toggle('active', (i + 1) === sd);
+  });
+  // Update info
+  const p = PROMPTS.find(p => p.dir === lbState.promptDir);
+  let info = `<b>${p ? p.label : lbState.promptDir}</b> — ${lbState.setting} — seed ${sd}`;
+  if (p) info += `<br><span style="font-size:.82rem;color:#999;">${p.prompt}</span>`;
+  document.getElementById('lbInfo').innerHTML = info;
+}
+
+// Navigate between settings in lightbox
+function lbNavigate(dir) {
+  const idx = SETTINGS.findIndex(s => s.name === lbState.setting);
+  const next = idx + dir;
+  if (next >= 0 && next < SETTINGS.length) {
+    openLB(lbState.promptDir, SETTINGS[next].name, lbState.seed);
+  }
+}
+
+document.getElementById('lightbox').onclick = () => document.getElementById('lightbox').classList.remove('active');
+document.getElementById('lbClose').onclick = e => { e.stopPropagation(); document.getElementById('lightbox').classList.remove('active'); };
+document.getElementById('lbPrev').onclick = e => { e.stopPropagation(); lbNavigate(-1); };
+document.getElementById('lbNext').onclick = e => { e.stopPropagation(); lbNavigate(1); };
+document.addEventListener('keydown', e => {
+  if (!document.getElementById('lightbox').classList.contains('active')) return;
+  if (e.key === 'Escape') document.getElementById('lightbox').classList.remove('active');
+  if (e.key === 'ArrowLeft') lbNavigate(-1);
+  if (e.key === 'ArrowRight') lbNavigate(1);
+  if (e.key >= '1' && e.key <= '5') switchLBSeed(parseInt(e.key));
+});
+
+/* ══════════════════════════════════════════
+   INIT
+   ══════════════════════════════════════════ */
+activePromptIdx = 1;
+renderSidebar();
+render();
+</script>
+</body>
+</html>

@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Batch Rollback Test — Image Viewer</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #131320; color: #eee; padding: 20px 30px; }
+  h1 { text-align: center; margin-bottom: 4px; font-size: 1.5rem; color: #e0e0ff; }
+  .subtitle { text-align: center; color: #666; margin-bottom: 24px; font-size: 0.85rem; }
+
+  /* ── Nav tabs ── */
+  .tabs { display: flex; justify-content: center; gap: 6px; margin-bottom: 24px; }
+  .tabs button {
+    padding: 8px 20px; border-radius: 6px; border: 1px solid #444;
+    background: #1e1e32; color: #aaa; font-size: 0.9rem; cursor: pointer; transition: all .15s;
+  }
+  .tabs button.active { background: #3a3a6a; color: #fff; border-color: #7ecfff; }
+  .tabs button:hover { border-color: #7ecfff; color: #ccc; }
+
+  /* ── Base image ── */
+  .base-section { text-align: center; margin-bottom: 30px; }
+  .base-section h2 { color: #7ecfff; margin-bottom: 10px; font-size: 1rem; }
+  .base-section img { max-width: 360px; border-radius: 8px; border: 2px solid #7ecfff; cursor: pointer; }
+  .base-section .hint { color: #666; font-size: 0.78rem; margin-top: 6px; }
+
+  /* ── Section headers ── */
+  .section-title {
+    font-size: 1.15rem; color: #c0c0ff; margin: 32px 0 6px;
+    padding-bottom: 6px; border-bottom: 1px solid #2a2a44;
+  }
+  .section-desc { color: #777; font-size: 0.8rem; margin-bottom: 14px; }
+
+  /* ── Matrix table ── */
+  .matrix-wrap { overflow-x: auto; margin-bottom: 36px; }
+  table.matrix {
+    border-collapse: collapse; margin: 0 auto;
+  }
+  table.matrix th, table.matrix td {
+    border: 1px solid #2a2a44; text-align: center; vertical-align: middle;
+  }
+  table.matrix thead th {
+    background: #1e1e36; color: #aac; padding: 8px 12px; font-size: 0.85rem;
+    position: sticky; top: 0; z-index: 2;
+  }
+  table.matrix tbody th {
+    background: #1a1a30; color: #cce; padding: 8px 14px; font-size: 0.82rem;
+    white-space: nowrap; font-weight: 600; text-align: left;
+  }
+  table.matrix tbody td {
+    padding: 4px; background: #16162a;
+  }
+  table.matrix tbody td img {
+    width: 160px; height: 160px; object-fit: cover;
+    border-radius: 5px; cursor: pointer; transition: transform .15s, box-shadow .15s;
+    display: block; margin: 0 auto;
+  }
+  table.matrix tbody td img:hover {
+    transform: scale(1.08); box-shadow: 0 0 12px rgba(126,207,255,.5); z-index: 1; position: relative;
+  }
+  table.matrix tbody td.empty { color: #333; font-size: 0.75rem; }
+
+  /* scale badge */
+  .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.75rem; font-weight: 700; margin-right: 3px; }
+  .badge-scale { background: #2d4a6a; color: #8cc8ff; }
+  .badge-rb { background: #3a2d5a; color: #c8a8ff; }
+  .badge-gap { background: #2a3a2a; color: #8fca8f; font-weight: 400; font-size: 0.7rem; }
+  .arrow { color: #ff9966; font-weight: 700; margin: 0 2px; }
+
+  /* ── Dual-rule group ── */
+  .dual-group { margin-bottom: 28px; }
+  .dual-group-title {
+    font-size: 0.95rem; color: #ccb8ff; margin-bottom: 8px;
+    padding: 6px 12px; background: #1e1a30; border-radius: 6px; display: inline-block;
+  }
+
+  /* ── Size control ── */
+  .size-ctrl { text-align: center; margin-bottom: 18px; }
+  .size-ctrl label { color: #888; font-size: 0.82rem; margin-right: 6px; }
+  .size-ctrl input[type=range] { width: 180px; vertical-align: middle; accent-color: #7ecfff; }
+  .size-ctrl span { color: #aaa; font-size: 0.82rem; margin-left: 6px; }
+
+  /* ── Filter ── */
+  .filter-bar { display: flex; justify-content: center; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; align-items: center; }
+  .filter-bar input {
+    padding: 7px 12px; border-radius: 6px; border: 1px solid #444;
+    background: #1e1e32; color: #eee; font-size: 0.88rem; width: 280px;
+  }
+
+  /* ── Lightbox ── */
+  .lightbox {
+    display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(0,0,0,0.93); z-index: 1000; justify-content: center; align-items: center;
+    flex-direction: column; cursor: zoom-out;
+  }
+  .lightbox.active { display: flex; }
+  .lightbox img { max-width: 90vw; max-height: 78vh; border-radius: 8px; }
+  .lightbox .lb-info { color: #ccc; margin-top: 14px; font-size: 1rem; text-align: center; line-height: 1.6; }
+  .lightbox .lb-close { position: absolute; top: 18px; right: 28px; font-size: 2rem; color: #fff; cursor: pointer; }
+
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<h1>🔁 Batch Rollback Experiment Viewer</h1>
+<p class="subtitle">outputs/outputs_loop_exp/batch_rollback_test</p>
+
+<div class="tabs">
+  <button class="active" onclick="switchTab('single')">📊 Single Rule</button>
+  <button onclick="switchTab('dual')">📊 Dual Rule</button>
+  <button onclick="switchTab('all')">🖼️ All (Grid)</button>
+</div>
+
+<div class="base-section">
+  <h2>📌 Base Image (no rollback)</h2>
+  <img id="baseImg" src="" onclick="openLB(this.src, 'Base — no rollback')" loading="lazy">
+  <div class="hint">所有 rollback 實驗以此為基準對照</div>
+</div>
+
+<div class="size-ctrl">
+  <label>縮圖大小:</label>
+  <input type="range" id="sizeSlider" min="80" max="320" value="160" step="20">
+  <span id="sizeLabel">160px</span>
+</div>
+
+<!-- ═══════════ SINGLE RULE TAB ═══════════ -->
+<div id="tab-single">
+  <h2 class="section-title">Single Rule — 矩陣總覽</h2>
+  <p class="section-desc">
+    行 = <span class="badge badge-scale">Trigger Scale</span> <span class="arrow">→</span> <span class="badge badge-rb">Rollback To</span>
+    <span class="badge badge-gap">gap</span>
+    ，列 = 重複次數 ×1 / ×2 / ×3。每格為該參數組合生成的圖。
+  </p>
+  <div class="matrix-wrap" id="singleMatrix"></div>
+</div>
+
+<!-- ═══════════ DUAL RULE TAB ═══════════ -->
+<div id="tab-dual" class="hidden">
+  <h2 class="section-title">Dual Rule — 分組矩陣</h2>
+  <p class="section-desc">
+    依第一條規則分組，每組內以第二條規則為行，列 = ×1 / ×2 / ×3。
+  </p>
+  <div id="dualContent"></div>
+</div>
+
+<!-- ═══════════ ALL TAB ═══════════ -->
+<div id="tab-all" class="hidden">
+  <h2 class="section-title">All Images — Grid View</h2>
+  <div class="filter-bar">
+    <input type="text" id="gridFilter" placeholder="🔍 篩選 (e.g. s4rb2, x3 …)">
+  </div>
+  <p id="gridCount" style="text-align:center;color:#777;font-size:.82rem;margin-bottom:12px;"></p>
+  <div id="gridGallery" style="display:grid;gap:10px;"></div>
+</div>
+
+<!-- ═══════════ LIGHTBOX ═══════════ -->
+<div class="lightbox" id="lightbox">
+  <span class="lb-close" id="lbClose">&times;</span>
+  <img id="lbImg" src="">
+  <div class="lb-info" id="lbInfo"></div>
+</div>
+
+<script>
+const IMG_DIR = '../outputs/outputs_loop_exp/batch_rollback_test/';
+
+const FILES = [
+  "output_base.jpg",
+  "output_rollback_s3rb0_s4rb3_x1.jpg","output_rollback_s3rb0_s4rb3_x2.jpg","output_rollback_s3rb0_s4rb3_x3.jpg",
+  "output_rollback_s3rb0_s5rb3_x1.jpg","output_rollback_s3rb0_s5rb3_x2.jpg","output_rollback_s3rb0_s5rb3_x3.jpg",
+  "output_rollback_s3rb0_s5rb4_x1.jpg","output_rollback_s3rb0_s5rb4_x2.jpg","output_rollback_s3rb0_s5rb4_x3.jpg",
+  "output_rollback_s3rb0_s6rb3_x1.jpg","output_rollback_s3rb0_s6rb3_x2.jpg","output_rollback_s3rb0_s6rb3_x3.jpg",
+  "output_rollback_s3rb0_s6rb4_x1.jpg","output_rollback_s3rb0_s6rb4_x2.jpg","output_rollback_s3rb0_s6rb4_x3.jpg",
+  "output_rollback_s3rb0_s6rb5_x1.jpg","output_rollback_s3rb0_s6rb5_x2.jpg","output_rollback_s3rb0_s6rb5_x3.jpg",
+  "output_rollback_s3rb0_s7rb4_x1.jpg","output_rollback_s3rb0_s7rb4_x2.jpg","output_rollback_s3rb0_s7rb4_x3.jpg",
+  "output_rollback_s3rb0_s7rb5_x1.jpg","output_rollback_s3rb0_s7rb5_x2.jpg","output_rollback_s3rb0_s7rb5_x3.jpg",
+  "output_rollback_s3rb0_s7rb6_x1.jpg","output_rollback_s3rb0_s7rb6_x2.jpg","output_rollback_s3rb0_s7rb6_x3.jpg",
+  "output_rollback_s3rb0_s8rb5_x1.jpg","output_rollback_s3rb0_s8rb5_x2.jpg","output_rollback_s3rb0_s8rb5_x3.jpg",
+  "output_rollback_s3rb0_s8rb6_x1.jpg","output_rollback_s3rb0_s8rb6_x2.jpg","output_rollback_s3rb0_s8rb6_x3.jpg",
+  "output_rollback_s3rb0_s8rb7_x1.jpg","output_rollback_s3rb0_s8rb7_x2.jpg","output_rollback_s3rb0_s8rb7_x3.jpg",
+  "output_rollback_s3rb0x1.jpg","output_rollback_s3rb0x2.jpg","output_rollback_s3rb0x3.jpg",
+  "output_rollback_s3rb1_s4rb3_x1.jpg","output_rollback_s3rb1_s4rb3_x2.jpg","output_rollback_s3rb1_s4rb3_x3.jpg",
+  "output_rollback_s3rb1_s5rb3_x1.jpg","output_rollback_s3rb1_s5rb3_x2.jpg","output_rollback_s3rb1_s5rb3_x3.jpg",
+  "output_rollback_s3rb1_s5rb4_x1.jpg","output_rollback_s3rb1_s5rb4_x2.jpg","output_rollback_s3rb1_s5rb4_x3.jpg",
+  "output_rollback_s3rb1_s6rb3_x1.jpg","output_rollback_s3rb1_s6rb3_x2.jpg","output_rollback_s3rb1_s6rb3_x3.jpg",
+  "output_rollback_s3rb1_s6rb4_x1.jpg","output_rollback_s3rb1_s6rb4_x2.jpg","output_rollback_s3rb1_s6rb4_x3.jpg",
+  "output_rollback_s3rb1_s6rb5_x1.jpg","output_rollback_s3rb1_s6rb5_x2.jpg","output_rollback_s3rb1_s6rb5_x3.jpg",
+  "output_rollback_s3rb1_s7rb4_x1.jpg","output_rollback_s3rb1_s7rb4_x2.jpg","output_rollback_s3rb1_s7rb4_x3.jpg",
+  "output_rollback_s3rb1_s7rb5_x1.jpg","output_rollback_s3rb1_s7rb5_x2.jpg","output_rollback_s3rb1_s7rb5_x3.jpg",
+  "output_rollback_s3rb1_s7rb6_x1.jpg","output_rollback_s3rb1_s7rb6_x2.jpg","output_rollback_s3rb1_s7rb6_x3.jpg",
+  "output_rollback_s3rb1_s8rb5_x1.jpg","output_rollback_s3rb1_s8rb5_x2.jpg","output_rollback_s3rb1_s8rb5_x3.jpg",
+  "output_rollback_s3rb1_s8rb6_x1.jpg","output_rollback_s3rb1_s8rb6_x2.jpg","output_rollback_s3rb1_s8rb6_x3.jpg",
+  "output_rollback_s3rb1_s8rb7_x1.jpg","output_rollback_s3rb1_s8rb7_x2.jpg","output_rollback_s3rb1_s8rb7_x3.jpg",
+  "output_rollback_s3rb1x1.jpg","output_rollback_s3rb1x2.jpg","output_rollback_s3rb1x3.jpg",
+  "output_rollback_s3rb2_s4rb3_x1.jpg","output_rollback_s3rb2_s4rb3_x2.jpg","output_rollback_s3rb2_s4rb3_x3.jpg",
+  "output_rollback_s3rb2_s5rb3_x1.jpg","output_rollback_s3rb2_s5rb3_x2.jpg","output_rollback_s3rb2_s5rb3_x3.jpg",
+  "output_rollback_s3rb2_s5rb4_x1.jpg","output_rollback_s3rb2_s5rb4_x2.jpg","output_rollback_s3rb2_s5rb4_x3.jpg",
+  "output_rollback_s3rb2_s6rb3_x1.jpg","output_rollback_s3rb2_s6rb3_x2.jpg","output_rollback_s3rb2_s6rb3_x3.jpg",
+  "output_rollback_s3rb2_s6rb4_x1.jpg","output_rollback_s3rb2_s6rb4_x2.jpg","output_rollback_s3rb2_s6rb4_x3.jpg",
+  "output_rollback_s3rb2_s6rb5_x1.jpg","output_rollback_s3rb2_s6rb5_x2.jpg","output_rollback_s3rb2_s6rb5_x3.jpg",
+  "output_rollback_s3rb2_s7rb4_x1.jpg","output_rollback_s3rb2_s7rb4_x2.jpg","output_rollback_s3rb2_s7rb4_x3.jpg",
+  "output_rollback_s3rb2_s7rb5_x1.jpg","output_rollback_s3rb2_s7rb5_x2.jpg","output_rollback_s3rb2_s7rb5_x3.jpg",
+  "output_rollback_s3rb2_s7rb6_x1.jpg","output_rollback_s3rb2_s7rb6_x2.jpg","output_rollback_s3rb2_s7rb6_x3.jpg",
+  "output_rollback_s3rb2_s8rb5_x1.jpg","output_rollback_s3rb2_s8rb5_x2.jpg","output_rollback_s3rb2_s8rb5_x3.jpg",
+  "output_rollback_s3rb2_s8rb6_x1.jpg","output_rollback_s3rb2_s8rb6_x2.jpg","output_rollback_s3rb2_s8rb6_x3.jpg",
+  "output_rollback_s3rb2_s8rb7_x1.jpg","output_rollback_s3rb2_s8rb7_x2.jpg","output_rollback_s3rb2_s8rb7_x3.jpg",
+  "output_rollback_s3rb2x1.jpg","output_rollback_s3rb2x2.jpg","output_rollback_s3rb2x3.jpg",
+  "output_rollback_s4rb1_s5rb4_x1.jpg","output_rollback_s4rb1_s5rb4_x2.jpg","output_rollback_s4rb1_s5rb4_x3.jpg",
+  "output_rollback_s4rb1_s6rb4_x1.jpg","output_rollback_s4rb1_s6rb4_x2.jpg","output_rollback_s4rb1_s6rb4_x3.jpg",
+  "output_rollback_s4rb1_s6rb5_x1.jpg","output_rollback_s4rb1_s6rb5_x2.jpg","output_rollback_s4rb1_s6rb5_x3.jpg",
+  "output_rollback_s4rb1_s7rb4_x1.jpg","output_rollback_s4rb1_s7rb4_x2.jpg","output_rollback_s4rb1_s7rb4_x3.jpg",
+  "output_rollback_s4rb1_s7rb5_x1.jpg","output_rollback_s4rb1_s7rb5_x2.jpg","output_rollback_s4rb1_s7rb5_x3.jpg",
+  "output_rollback_s4rb1_s7rb6_x1.jpg","output_rollback_s4rb1_s7rb6_x2.jpg","output_rollback_s4rb1_s7rb6_x3.jpg",
+  "output_rollback_s4rb1_s8rb5_x1.jpg","output_rollback_s4rb1_s8rb5_x2.jpg","output_rollback_s4rb1_s8rb5_x3.jpg",
+  "output_rollback_s4rb1_s8rb6_x1.jpg","output_rollback_s4rb1_s8rb6_x2.jpg","output_rollback_s4rb1_s8rb6_x3.jpg",
+  "output_rollback_s4rb1_s8rb7_x1.jpg","output_rollback_s4rb1_s8rb7_x2.jpg","output_rollback_s4rb1_s8rb7_x3.jpg",
+  "output_rollback_s4rb1x1.jpg","output_rollback_s4rb1x2.jpg","output_rollback_s4rb1x3.jpg",
+  "output_rollback_s4rb2_s5rb4_x1.jpg","output_rollback_s4rb2_s5rb4_x2.jpg","output_rollback_s4rb2_s5rb4_x3.jpg",
+  "output_rollback_s4rb2_s6rb4_x1.jpg","output_rollback_s4rb2_s6rb4_x2.jpg","output_rollback_s4rb2_s6rb4_x3.jpg",
+  "output_rollback_s4rb2_s6rb5_x1.jpg","output_rollback_s4rb2_s6rb5_x2.jpg","output_rollback_s4rb2_s6rb5_x3.jpg",
+  "output_rollback_s4rb2_s7rb4_x1.jpg","output_rollback_s4rb2_s7rb4_x2.jpg","output_rollback_s4rb2_s7rb4_x3.jpg",
+  "output_rollback_s4rb2_s7rb5_x1.jpg","output_rollback_s4rb2_s7rb5_x2.jpg","output_rollback_s4rb2_s7rb5_x3.jpg",
+  "output_rollback_s4rb2_s7rb6_x1.jpg","output_rollback_s4rb2_s7rb6_x2.jpg","output_rollback_s4rb2_s7rb6_x3.jpg",
+  "output_rollback_s4rb2_s8rb5_x1.jpg","output_rollback_s4rb2_s8rb5_x2.jpg","output_rollback_s4rb2_s8rb5_x3.jpg",
+  "output_rollback_s4rb2_s8rb6_x1.jpg","output_rollback_s4rb2_s8rb6_x2.jpg","output_rollback_s4rb2_s8rb6_x3.jpg",
+  "output_rollback_s4rb2_s8rb7_x1.jpg","output_rollback_s4rb2_s8rb7_x2.jpg","output_rollback_s4rb2_s8rb7_x3.jpg",
+  "output_rollback_s4rb2x1.jpg","output_rollback_s4rb2x2.jpg","output_rollback_s4rb2x3.jpg",
+  "output_rollback_s4rb3_s5rb4_x1.jpg","output_rollback_s4rb3_s5rb4_x2.jpg","output_rollback_s4rb3_s5rb4_x3.jpg",
+  "output_rollback_s4rb3_s6rb4_x1.jpg","output_rollback_s4rb3_s6rb4_x2.jpg","output_rollback_s4rb3_s6rb4_x3.jpg",
+  "output_rollback_s4rb3_s6rb5_x1.jpg","output_rollback_s4rb3_s6rb5_x2.jpg","output_rollback_s4rb3_s6rb5_x3.jpg",
+  "output_rollback_s4rb3_s7rb4_x1.jpg","output_rollback_s4rb3_s7rb4_x2.jpg","output_rollback_s4rb3_s7rb4_x3.jpg",
+  "output_rollback_s4rb3_s7rb5_x1.jpg","output_rollback_s4rb3_s7rb5_x2.jpg","output_rollback_s4rb3_s7rb5_x3.jpg",
+  "output_rollback_s4rb3_s7rb6_x1.jpg","output_rollback_s4rb3_s7rb6_x2.jpg","output_rollback_s4rb3_s7rb6_x3.jpg",
+  "output_rollback_s4rb3_s8rb5_x1.jpg","output_rollback_s4rb3_s8rb5_x2.jpg","output_rollback_s4rb3_s8rb5_x3.jpg",
+  "output_rollback_s4rb3_s8rb6_x1.jpg","output_rollback_s4rb3_s8rb6_x2.jpg","output_rollback_s4rb3_s8rb6_x3.jpg",
+  "output_rollback_s4rb3_s8rb7_x1.jpg","output_rollback_s4rb3_s8rb7_x2.jpg","output_rollback_s4rb3_s8rb7_x3.jpg",
+  "output_rollback_s4rb3x1.jpg","output_rollback_s4rb3x2.jpg","output_rollback_s4rb3x3.jpg",
+  "output_rollback_s5rb2_s6rb5_x1.jpg","output_rollback_s5rb2_s6rb5_x2.jpg","output_rollback_s5rb2_s6rb5_x3.jpg",
+  "output_rollback_s5rb2_s7rb5_x1.jpg","output_rollback_s5rb2_s7rb5_x2.jpg","output_rollback_s5rb2_s7rb5_x3.jpg",
+  "output_rollback_s5rb2_s7rb6_x1.jpg","output_rollback_s5rb2_s7rb6_x2.jpg","output_rollback_s5rb2_s7rb6_x3.jpg",
+  "output_rollback_s5rb2_s8rb5_x1.jpg","output_rollback_s5rb2_s8rb5_x2.jpg","output_rollback_s5rb2_s8rb5_x3.jpg",
+  "output_rollback_s5rb2_s8rb6_x1.jpg","output_rollback_s5rb2_s8rb6_x2.jpg","output_rollback_s5rb2_s8rb6_x3.jpg",
+  "output_rollback_s5rb2_s8rb7_x1.jpg","output_rollback_s5rb2_s8rb7_x2.jpg","output_rollback_s5rb2_s8rb7_x3.jpg",
+  "output_rollback_s5rb2x1.jpg","output_rollback_s5rb2x2.jpg","output_rollback_s5rb2x3.jpg",
+  "output_rollback_s5rb3_s6rb5_x1.jpg","output_rollback_s5rb3_s6rb5_x2.jpg","output_rollback_s5rb3_s6rb5_x3.jpg",
+  "output_rollback_s5rb3_s7rb5_x1.jpg","output_rollback_s5rb3_s7rb5_x2.jpg","output_rollback_s5rb3_s7rb5_x3.jpg",
+  "output_rollback_s5rb3_s7rb6_x1.jpg","output_rollback_s5rb3_s7rb6_x2.jpg","output_rollback_s5rb3_s7rb6_x3.jpg",
+  "output_rollback_s5rb3_s8rb5_x1.jpg","output_rollback_s5rb3_s8rb5_x2.jpg","output_rollback_s5rb3_s8rb5_x3.jpg",
+  "output_rollback_s5rb3_s8rb6_x1.jpg","output_rollback_s5rb3_s8rb6_x2.jpg","output_rollback_s5rb3_s8rb6_x3.jpg",
+  "output_rollback_s5rb3_s8rb7_x1.jpg","output_rollback_s5rb3_s8rb7_x2.jpg","output_rollback_s5rb3_s8rb7_x3.jpg",
+  "output_rollback_s5rb3x1.jpg","output_rollback_s5rb3x2.jpg","output_rollback_s5rb3x3.jpg",
+  "output_rollback_s5rb4_s6rb5_x1.jpg","output_rollback_s5rb4_s6rb5_x2.jpg","output_rollback_s5rb4_s6rb5_x3.jpg",
+  "output_rollback_s5rb4_s7rb5_x1.jpg","output_rollback_s5rb4_s7rb5_x2.jpg","output_rollback_s5rb4_s7rb5_x3.jpg",
+  "output_rollback_s5rb4_s7rb6_x1.jpg","output_rollback_s5rb4_s7rb6_x2.jpg","output_rollback_s5rb4_s7rb6_x3.jpg",
+  "output_rollback_s5rb4_s8rb5_x1.jpg","output_rollback_s5rb4_s8rb5_x2.jpg","output_rollback_s5rb4_s8rb5_x3.jpg",
+  "output_rollback_s5rb4_s8rb6_x1.jpg","output_rollback_s5rb4_s8rb6_x2.jpg","output_rollback_s5rb4_s8rb6_x3.jpg",
+  "output_rollback_s5rb4_s8rb7_x1.jpg","output_rollback_s5rb4_s8rb7_x2.jpg","output_rollback_s5rb4_s8rb7_x3.jpg",
+  "output_rollback_s5rb4x1.jpg","output_rollback_s5rb4x2.jpg","output_rollback_s5rb4x3.jpg",
+  "output_rollback_s6rb3_s7rb6_x1.jpg","output_rollback_s6rb3_s7rb6_x2.jpg","output_rollback_s6rb3_s7rb6_x3.jpg",
+  "output_rollback_s6rb3_s8rb6_x1.jpg","output_rollback_s6rb3_s8rb6_x2.jpg","output_rollback_s6rb3_s8rb6_x3.jpg",
+  "output_rollback_s6rb3_s8rb7_x1.jpg","output_rollback_s6rb3_s8rb7_x2.jpg","output_rollback_s6rb3_s8rb7_x3.jpg",
+  "output_rollback_s6rb3x1.jpg","output_rollback_s6rb3x2.jpg","output_rollback_s6rb3x3.jpg",
+  "output_rollback_s6rb4_s7rb6_x1.jpg","output_rollback_s6rb4_s7rb6_x2.jpg","output_rollback_s6rb4_s7rb6_x3.jpg",
+  "output_rollback_s6rb4_s8rb6_x1.jpg","output_rollback_s6rb4_s8rb6_x2.jpg","output_rollback_s6rb4_s8rb6_x3.jpg",
+  "output_rollback_s6rb4_s8rb7_x1.jpg","output_rollback_s6rb4_s8rb7_x2.jpg","output_rollback_s6rb4_s8rb7_x3.jpg",
+  "output_rollback_s6rb4x1.jpg","output_rollback_s6rb4x2.jpg","output_rollback_s6rb4x3.jpg",
+  "output_rollback_s6rb5_s7rb6_x1.jpg","output_rollback_s6rb5_s7rb6_x2.jpg","output_rollback_s6rb5_s7rb6_x3.jpg",
+  "output_rollback_s6rb5_s8rb6_x1.jpg","output_rollback_s6rb5_s8rb6_x2.jpg","output_rollback_s6rb5_s8rb6_x3.jpg",
+  "output_rollback_s6rb5_s8rb7_x1.jpg","output_rollback_s6rb5_s8rb7_x2.jpg","output_rollback_s6rb5_s8rb7_x3.jpg",
+  "output_rollback_s6rb5x1.jpg","output_rollback_s6rb5x2.jpg","output_rollback_s6rb5x3.jpg",
+  "output_rollback_s7rb4_s8rb7_x1.jpg","output_rollback_s7rb4_s8rb7_x2.jpg","output_rollback_s7rb4_s8rb7_x3.jpg",
+  "output_rollback_s7rb4x1.jpg","output_rollback_s7rb4x2.jpg","output_rollback_s7rb4x3.jpg",
+  "output_rollback_s7rb5_s8rb7_x1.jpg","output_rollback_s7rb5_s8rb7_x2.jpg","output_rollback_s7rb5_s8rb7_x3.jpg",
+  "output_rollback_s7rb5x1.jpg","output_rollback_s7rb5x2.jpg","output_rollback_s7rb5x3.jpg",
+  "output_rollback_s7rb6_s8rb7_x1.jpg","output_rollback_s7rb6_s8rb7_x2.jpg","output_rollback_s7rb6_s8rb7_x3.jpg",
+  "output_rollback_s7rb6x1.jpg","output_rollback_s7rb6x2.jpg","output_rollback_s7rb6x3.jpg",
+  "output_rollback_s8rb5x1.jpg","output_rollback_s8rb5x2.jpg","output_rollback_s8rb5x3.jpg",
+  "output_rollback_s8rb6x1.jpg","output_rollback_s8rb6x2.jpg","output_rollback_s8rb6x3.jpg",
+  "output_rollback_s8rb7x1.jpg","output_rollback_s8rb7x2.jpg","output_rollback_s8rb7x3.jpg",
+];
+
+/* ── Parse filenames ── */
+function parseFile(f) {
+  if (f === 'output_base.jpg') return { name: f, type: 'base', rules: [], times: 0 };
+  const body = f.replace('output_rollback_', '').replace('.jpg', '');
+  const parts = body.split('_');
+  const rules = [];
+  let times = 1;
+  for (const p of parts) {
+    const tm = p.match(/^x(\d+)$/);
+    if (tm) { times = parseInt(tm[1]); continue; }
+    const rm = p.match(/^s(\d+)rb(\d+)(?:x(\d+))?$/);
+    if (rm) {
+      if (rm[3]) times = parseInt(rm[3]);
+      rules.push({ scale: parseInt(rm[1]), rb: parseInt(rm[2]) });
+    }
+  }
+  const type = rules.length > 1 ? 'dual' : 'single';
+  return { name: f, type, rules, times };
+}
+
+const allImages = FILES.map(parseFile);
+const baseFile = allImages.find(i => i.type === 'base');
+const singles = allImages.filter(i => i.type === 'single');
+const duals = allImages.filter(i => i.type === 'dual');
+
+/* ── Base image ── */
+document.getElementById('baseImg').src = IMG_DIR + baseFile.name;
+
+function imgSrc(name) { return IMG_DIR + name; }
+
+function ruleBadge(r) {
+  return `<span class="badge badge-scale">S${r.scale}</span>`
+    + `<span class="arrow">→</span>`
+    + `<span class="badge badge-rb">${r.rb}</span>`
+    + `<span class="badge badge-gap">gap ${r.scale - r.rb}</span>`;
+}
+
+/* ══════════════════════════════════
+   SINGLE RULE — Matrix Table
+   ══════════════════════════════════ */
+function buildSingleMatrix() {
+  const combos = new Map();
+  singles.forEach(img => {
+    const r = img.rules[0];
+    const key = `s${r.scale}rb${r.rb}`;
+    if (!combos.has(key)) combos.set(key, r);
+  });
+  const comboList = [...combos.values()].sort((a, b) => a.scale - b.scale || a.rb - b.rb);
+
+  const fileLookup = {};
+  singles.forEach(img => {
+    const r = img.rules[0];
+    fileLookup[`s${r.scale}rb${r.rb}_x${img.times}`] = img.name;
+  });
+
+  let html = `<table class="matrix"><thead><tr>
+    <th style="min-width:220px">Trigger Scale → Rollback To</th>
+    <th>×1</th><th>×2</th><th>×3</th>
+  </tr></thead><tbody>`;
+
+  for (const combo of comboList) {
+    html += `<tr><th>${ruleBadge(combo)}</th>`;
+    for (const t of [1, 2, 3]) {
+      const key = `s${combo.scale}rb${combo.rb}_x${t}`;
+      const fname = fileLookup[key];
+      if (fname) {
+        const info = `Scale ${combo.scale} → Rollback to ${combo.rb}  (gap ${combo.scale - combo.rb}),  ×${t}`;
+        html += `<td><img class="thumb" src="${imgSrc(fname)}" loading="lazy"
+          onclick="openLB('${imgSrc(fname)}','${info}')"
+          title="${info}"></td>`;
+      } else {
+        html += `<td class="empty">—</td>`;
+      }
+    }
+    html += `</tr>`;
+  }
+  html += `</tbody></table>`;
+  document.getElementById('singleMatrix').innerHTML = html;
+}
+
+/* ══════════════════════════════════
+   DUAL RULE — Grouped by Rule 1
+   ══════════════════════════════════ */
+function buildDualContent() {
+  const groups = new Map();
+  duals.forEach(img => {
+    const r1 = img.rules[0], r2 = img.rules[1];
+    const gKey = `s${r1.scale}rb${r1.rb}`;
+    if (!groups.has(gKey)) groups.set(gKey, { rule1: r1, items: [] });
+    groups.get(gKey).items.push({ img, rule2: r2, times: img.times });
+  });
+
+  const sortedGroups = [...groups.values()].sort((a, b) =>
+    a.rule1.scale - b.rule1.scale || a.rule1.rb - b.rule1.rb);
+
+  let html = '';
+  for (const g of sortedGroups) {
+    html += `<div class="dual-group">`;
+    html += `<div class="dual-group-title">Rule 1: ${ruleBadge(g.rule1)}</div>`;
+
+    const rule2Map = new Map();
+    g.items.forEach(item => {
+      const k2 = `s${item.rule2.scale}rb${item.rule2.rb}`;
+      if (!rule2Map.has(k2)) rule2Map.set(k2, item.rule2);
+    });
+    const rule2List = [...rule2Map.values()].sort((a, b) => a.scale - b.scale || a.rb - b.rb);
+
+    const fl = {};
+    g.items.forEach(item => {
+      fl[`s${item.rule2.scale}rb${item.rule2.rb}_x${item.times}`] = item.img.name;
+    });
+
+    html += `<table class="matrix"><thead><tr>
+      <th style="min-width:220px">Rule 2</th>
+      <th>×1</th><th>×2</th><th>×3</th>
+    </tr></thead><tbody>`;
+
+    for (const r2 of rule2List) {
+      html += `<tr><th>${ruleBadge(r2)}</th>`;
+      for (const t of [1, 2, 3]) {
+        const key = `s${r2.scale}rb${r2.rb}_x${t}`;
+        const fname = fl[key];
+        if (fname) {
+          const info = `Rule1: S${g.rule1.scale}→${g.rule1.rb}  +  Rule2: S${r2.scale}→${r2.rb},  ×${t}`;
+          html += `<td><img class="thumb" src="${imgSrc(fname)}" loading="lazy"
+            onclick="openLB('${imgSrc(fname)}','${info}')"
+            title="${info}"></td>`;
+        } else {
+          html += `<td class="empty">—</td>`;
+        }
+      }
+      html += `</tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+  document.getElementById('dualContent').innerHTML = html;
+}
+
+/* ══════════════════════════════════
+   ALL — Flat grid (with filter)
+   ══════════════════════════════════ */
+function renderAllGrid() {
+  const q = document.getElementById('gridFilter').value.toLowerCase();
+  const rollbacks = allImages.filter(i => i.type !== 'base');
+  const filtered = q ? rollbacks.filter(i => i.name.toLowerCase().includes(q)) : rollbacks;
+
+  document.getElementById('gridCount').textContent = `${filtered.length} / ${rollbacks.length} images`;
+  const size = parseInt(document.getElementById('sizeSlider').value);
+  const gallery = document.getElementById('gridGallery');
+  gallery.style.gridTemplateColumns = `repeat(auto-fill, minmax(${size + 30}px, 1fr))`;
+
+  gallery.innerHTML = filtered.map(img => {
+    const ruleStr = img.rules.map(r => `S${r.scale}→${r.rb}`).join(' + ') + ` ×${img.times}`;
+    return `<div style="background:#1a1a30;border-radius:6px;overflow:hidden;border:1px solid #2a2a44;text-align:center;">
+      <img src="${imgSrc(img.name)}" loading="lazy" style="width:100%;cursor:pointer;display:block;"
+        onclick="openLB('${imgSrc(img.name)}','${ruleStr.replace(/'/g,"\\'")}')">
+      <div style="padding:5px;font-size:.72rem;color:#999;">${ruleStr}</div>
+    </div>`;
+  }).join('');
+}
+
+/* ── Tab switching ── */
+let currentTab = 'single';
+function switchTab(tab) {
+  currentTab = tab;
+  document.querySelectorAll('.tabs button').forEach(b => b.classList.remove('active'));
+  document.querySelector(`.tabs button[onclick="switchTab('${tab}')"]`).classList.add('active');
+  document.getElementById('tab-single').classList.toggle('hidden', tab !== 'single');
+  document.getElementById('tab-dual').classList.toggle('hidden', tab !== 'dual');
+  document.getElementById('tab-all').classList.toggle('hidden', tab !== 'all');
+  if (tab === 'all') renderAllGrid();
+}
+
+/* ── Size slider ── */
+document.getElementById('sizeSlider').addEventListener('input', e => {
+  const v = e.target.value;
+  document.getElementById('sizeLabel').textContent = v + 'px';
+  document.querySelectorAll('table.matrix tbody td img').forEach(img => {
+    img.style.width = v + 'px';
+    img.style.height = v + 'px';
+  });
+  if (currentTab === 'all') renderAllGrid();
+});
+
+/* ── Grid filter ── */
+document.getElementById('gridFilter').addEventListener('input', renderAllGrid);
+
+/* ── Lightbox ── */
+function openLB(src, info) {
+  document.getElementById('lbImg').src = src;
+  document.getElementById('lbInfo').innerHTML = info;
+  document.getElementById('lightbox').classList.add('active');
+}
+document.getElementById('lightbox').onclick = () => document.getElementById('lightbox').classList.remove('active');
+document.getElementById('lbClose').onclick = e => { e.stopPropagation(); document.getElementById('lightbox').classList.remove('active'); };
+document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('lightbox').classList.remove('active'); });
+
+/* ── Init ── */
+buildSingleMatrix();
+buildDualContent();
+</script>
+</body>
+</html>
