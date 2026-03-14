@@ -18,8 +18,11 @@ import os
 import re
 import sys
 import json
+import time
 import argparse
+import difflib
 import traceback
+from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -35,6 +38,7 @@ if _ROOT not in sys.path:
 
 from tools.run_p2p_edit import (
     find_focus_token_indices,
+    _iqr_filtered_mean,
     collect_attention_text_masks,
     combine_and_store_masks,
     _save_masks_to_dir,
@@ -48,7 +52,7 @@ from tools.run_p2p_edit import (
 )
 from infinity.utils.bitwise_token_storage import BitwiseTokenStorage
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
-from attention_map.extractor import CrossAttentionExtractor
+from attention_map.extractor import CrossAttentionExtractor, AttentionCacheInjector
 
 
 # ============================================================
@@ -90,6 +94,223 @@ def extract_focus_words(blended_words: List[str]) -> Tuple[str, str]:
     return ' '.join(src_parts), ' '.join(tgt_parts)
 
 
+@dataclass
+class AttentionCachePair:
+    source_term: str
+    target_term: str
+    source_token_indices: List[int]
+    target_token_indices: List[int]
+
+
+def parse_blended_word_pairs(blended_words: List[str]) -> List[Tuple[str, str]]:
+    """將 PIE-Bench blended_words 轉為 (source_term, target_term) 配對列表。"""
+    pairs: List[Tuple[str, str]] = []
+    for item in blended_words or []:
+        left, right = (item.split(',', 1) + [''])[:2]
+        pairs.append((left.strip(), right.strip()))
+    return pairs
+
+
+def sanitize_term_for_path(term: str) -> str:
+    """將詞彙轉成可作為資料夾名稱的安全字串。"""
+    safe = re.sub(r'[^\w\-.]+', '_', term.strip(), flags=re.UNICODE)
+    safe = safe.strip('._')
+    return safe or 'empty'
+
+
+def build_attention_cache_pairs(
+    text_tokenizer,
+    source_prompt: str,
+    target_prompt: str,
+    blended_words: List[str],
+) -> Tuple[List[AttentionCachePair], Dict[str, List[int]]]:
+    """
+    依 blended_words 建立 source→target token 對齊。
+
+    Returns:
+        - 可用於 attention cache replace 的配對列表（僅保留 source/target 兩側皆存在者）
+        - 需要輸出的 source term -> source token indices（包含刪除詞，方便存 map）
+    """
+    cache_pairs: List[AttentionCachePair] = []
+    source_terms_to_export: Dict[str, List[int]] = {}
+
+    for src_term, tgt_term in parse_blended_word_pairs(blended_words):
+        src_token_indices = (
+            find_focus_token_indices(text_tokenizer, source_prompt, [src_term], verbose=False)
+            if src_term else []
+        )
+        tgt_token_indices = (
+            find_focus_token_indices(text_tokenizer, target_prompt, [tgt_term], verbose=False)
+            if tgt_term else []
+        )
+
+        if src_term and src_token_indices:
+            source_terms_to_export[src_term] = src_token_indices
+
+        if src_term and tgt_term and src_token_indices and tgt_token_indices:
+            cache_pairs.append(
+                AttentionCachePair(
+                    source_term=src_term,
+                    target_term=tgt_term,
+                    source_token_indices=src_token_indices,
+                    target_token_indices=tgt_token_indices,
+                )
+            )
+
+    return cache_pairs, source_terms_to_export
+
+
+def _extract_per_head_token_attention(
+    extractor: CrossAttentionExtractor,
+    block_idx: int,
+    scale_idx: int,
+    token_indices: List[int],
+) -> Optional[torch.Tensor]:
+    """從原始 attention cache 取出某一組 token 的 per-head 空間圖。"""
+    attn_list = extractor.attention_maps.get(block_idx)
+    if attn_list is None or scale_idx >= len(attn_list):
+        return None
+
+    attn_tensor = attn_list[scale_idx]  # [1, H, L, K]
+    valid_token_indices = [idx for idx in token_indices if idx < attn_tensor.shape[-1]]
+    if not valid_token_indices:
+        return None
+
+    per_head = attn_tensor[0, :, :, valid_token_indices].mean(dim=-1)  # [H, L]
+    return per_head.detach().cpu().float()
+
+
+def build_attention_cache_from_source(
+    extractor: CrossAttentionExtractor,
+    cache_pairs: List[AttentionCachePair],
+    source_terms_to_export: Dict[str, List[int]],
+    scale_schedule: List[Tuple[int, int, int]],
+    attn_block_indices: List[int],
+) -> Tuple[Dict[int, Dict[int, Dict[int, torch.Tensor]]], Dict[str, Dict[int, np.ndarray]]]:
+    """
+    從 source 生成得到的 attention maps 建立：
+      1. target replace 用的 per-block/per-scale attention cache
+      2. 每個 source term 的視覺化 heatmap
+    """
+    replacement_maps: Dict[int, Dict[int, Dict[int, torch.Tensor]]] = {}
+    export_maps: Dict[str, Dict[int, np.ndarray]] = {}
+
+    total_scales = len(scale_schedule)
+
+    for pair in cache_pairs:
+        for block_idx in attn_block_indices:
+            for scale_idx in range(total_scales):
+                src_map = _extract_per_head_token_attention(
+                    extractor=extractor,
+                    block_idx=block_idx,
+                    scale_idx=scale_idx,
+                    token_indices=pair.source_token_indices,
+                )
+                if src_map is None:
+                    continue
+                replacement_maps.setdefault(block_idx, {}).setdefault(scale_idx, {})
+                for tgt_token_idx in pair.target_token_indices:
+                    replacement_maps[block_idx][scale_idx][tgt_token_idx] = src_map.clone()
+
+    for term, token_indices in source_terms_to_export.items():
+        export_maps[term] = {}
+        for scale_idx, (_, h, w) in enumerate(scale_schedule):
+            block_maps: List[np.ndarray] = []
+            for block_idx in attn_block_indices:
+                attn_map = extractor.extract_word_attention(
+                    block_idx=block_idx,
+                    scale_idx=scale_idx,
+                    token_indices=token_indices,
+                    spatial_size=(h, w),
+                )
+                if attn_map is not None:
+                    block_maps.append(attn_map)
+            if not block_maps:
+                continue
+            filtered_attn, _, _ = _iqr_filtered_mean(
+                torch.tensor(np.stack(block_maps), dtype=torch.float32)
+            )
+            export_maps[term][scale_idx] = filtered_attn.astype(np.float32)
+
+    return replacement_maps, export_maps
+
+
+def save_attention_cache_maps(
+    export_maps: Dict[str, Dict[int, np.ndarray]],
+    scale_schedule: List[Tuple[int, int, int]],
+    save_root: str,
+) -> None:
+    """將每個 source term 的 attention cache heatmap 存成每 scale 一張圖。"""
+    if not export_maps:
+        return
+
+    os.makedirs(save_root, exist_ok=True)
+
+    for term, scale_maps in export_maps.items():
+        term_dir = os.path.join(save_root, sanitize_term_for_path(term))
+        os.makedirs(term_dir, exist_ok=True)
+
+        for scale_idx, (_, h, w) in enumerate(scale_schedule):
+            attn_map = scale_maps.get(scale_idx)
+            if attn_map is None:
+                attn_map = np.zeros((h, w), dtype=np.float32)
+
+            attn_min = float(attn_map.min())
+            attn_max = float(attn_map.max())
+            if attn_max > attn_min:
+                norm = (attn_map - attn_min) / (attn_max - attn_min)
+            else:
+                norm = np.zeros_like(attn_map, dtype=np.float32)
+
+            gray = np.clip(norm * 255.0, 0, 255).astype(np.uint8)
+            vis_size = max(256, h * 4, w * 4)
+            gray = cv2.resize(gray, (vis_size, vis_size), interpolation=cv2.INTER_CUBIC)
+            heatmap = cv2.applyColorMap(gray, cv2.COLORMAP_JET)
+            cv2.imwrite(
+                os.path.join(term_dir, f'scale{scale_idx + 1:02d}_{h}x{w}.png'),
+                heatmap,
+            )
+
+
+def save_attention_cache_metadata(
+    save_dir: str,
+    cache_pairs: List[AttentionCachePair],
+    source_terms_to_export: Dict[str, List[int]],
+    args,
+    total_scales: int,
+) -> None:
+    """將 attention cache 對齊資訊存成 JSON，方便後續對照。"""
+    os.makedirs(save_dir, exist_ok=True)
+    payload = {
+        'enabled': bool(args.use_attn_cache),
+        'phase': args.attn_cache_phase,
+        'max_scale_1_based': min(int(args.attn_cache_max_scale), total_scales),
+        'cache_pairs': [asdict(item) for item in cache_pairs],
+        'source_terms_to_export': source_terms_to_export,
+    }
+    with open(os.path.join(save_dir, 'alignments.json'), 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def ensure_case_reference_symlink(case_source_dir: str, save_dir: str) -> None:
+    """在輸出案例資料夾中建立回指原始 extracted_pie_bench 案例的符號連結。"""
+    if not case_source_dir:
+        return
+
+    os.makedirs(save_dir, exist_ok=True)
+    link_path = os.path.join(save_dir, 'source_case_dir')
+    target_path = os.path.abspath(case_source_dir)
+
+    if os.path.islink(link_path):
+        if os.path.realpath(link_path) == target_path:
+            return
+        os.unlink(link_path)
+    elif os.path.exists(link_path):
+        return
+
+    os.symlink(target_path, link_path)
+
+
 def load_and_resize_pie_masks(
     mask_path: str,
     scale_schedule: list,
@@ -124,6 +345,124 @@ def load_and_resize_pie_masks(
     return result, white_ratio
 
 
+def map_white_ratio_to_threshold(
+    white_ratio: float,
+    thr_min: float = 65.0,
+    thr_max: float = 92.0,
+) -> float:
+    """
+    將白色比例（0~1）反向線性映射到 attention threshold。
+      white=0.0 -> thr_max
+      white=1.0 -> thr_min
+    """
+    ratio = float(np.clip(white_ratio, 0.0, 1.0))
+    threshold = thr_max - ratio * (thr_max - thr_min)
+    return float(np.clip(threshold, thr_min, thr_max))
+
+
+def dilate_true_region(mask_bool: np.ndarray, expand_percent: float) -> np.ndarray:
+    """
+    對 bool mask 的 True 區域做膨脹（向外擴張）。
+    expand_percent: 以短邊比例計算半徑（例如 2.0 = 2% * min(h, w)）。
+    """
+    if expand_percent <= 0:
+        return mask_bool
+
+    h, w = mask_bool.shape
+    radius = int(round(min(h, w) * (expand_percent / 100.0)))
+    if radius <= 0:
+        return mask_bool
+
+    k = radius * 2 + 1
+    kernel = np.ones((k, k), dtype=np.uint8)
+    dilated = cv2.dilate(mask_bool.astype(np.uint8), kernel, iterations=1)
+    return dilated.astype(bool)
+
+
+def expand_storage_masks_inplace(
+    masks: Dict[int, torch.Tensor],
+    expand_percent: float,
+) -> None:
+    """
+    對 p2p_token_storage.masks（True=保留 source）逐 scale 向外擴張 True 區域。
+    """
+    if expand_percent <= 0 or not masks:
+        return
+
+    for si, mask_t in list(masks.items()):
+        mask_np = mask_t.squeeze().cpu().numpy().astype(bool)  # [h, w]
+        expanded = dilate_true_region(mask_np, expand_percent)
+        masks[si] = (
+            torch.tensor(expanded, dtype=torch.bool)
+            .unsqueeze(0).unsqueeze(0).unsqueeze(-1).cpu()
+        )
+
+
+def build_full_p2p_alignment(
+    text_tokenizer,
+    source_prompt: str,
+    target_prompt: str,
+    blended_words: Optional[List[str]] = None,
+) -> Dict[int, int]:
+    """
+    Prompt-to-Prompt 風格的完整 token 對齊。
+
+    使用 difflib.SequenceMatcher 先找出共同 token（自動對齊），
+    再用 blended_words 覆蓋 swap token 的映射。
+
+    回傳：target_token_idx -> source_token_idx
+    不在 dict 中的 target token = 新增 token，保留 target 自己的 attention。
+    """
+    src_enc = text_tokenizer(
+        text=[source_prompt], max_length=512,
+        padding='max_length', truncation=True, return_tensors='pt',
+    )
+    tgt_enc = text_tokenizer(
+        text=[target_prompt], max_length=512,
+        padding='max_length', truncation=True, return_tensors='pt',
+    )
+
+    src_ids = src_enc.input_ids[0].tolist()
+    tgt_ids = tgt_enc.input_ids[0].tolist()
+    src_len = sum(src_enc.attention_mask[0].tolist())
+    tgt_len = sum(tgt_enc.attention_mask[0].tolist())
+
+    src_ids_real = src_ids[:src_len]
+    tgt_ids_real = tgt_ids[:tgt_len]
+
+    # 1. SequenceMatcher 找出共同 token（common tokens）
+    matcher = difflib.SequenceMatcher(None, src_ids_real, tgt_ids_real)
+    alignment: Dict[int, int] = {}
+    for block in matcher.get_matching_blocks():
+        src_start, tgt_start, size = block
+        for offset in range(size):
+            alignment[tgt_start + offset] = src_start + offset
+
+    # 2. blended_words 覆蓋 swap token 映射
+    if blended_words:
+        for bw in blended_words:
+            parts = bw.split(',', 1)
+            src_word = parts[0].strip()
+            tgt_word = parts[1].strip() if len(parts) > 1 else ''
+            if not src_word or not tgt_word:
+                continue
+
+            src_indices = find_focus_token_indices(
+                text_tokenizer, source_prompt, [src_word], verbose=False,
+            )
+            tgt_indices = find_focus_token_indices(
+                text_tokenizer, target_prompt, [tgt_word], verbose=False,
+            )
+            if not src_indices or not tgt_indices:
+                continue
+
+            for i, tgt_i in enumerate(tgt_indices):
+                src_i = src_indices[min(i, len(src_indices) - 1)]
+                alignment[tgt_i] = src_i
+
+    return alignment
+
+
 # ============================================================
 # 單一案例處理
 # ============================================================
@@ -145,6 +484,8 @@ def run_one_case(
     total_scales: int,
     device_cuda: torch.device,
     mask_path: Optional[str] = None,
+    blended_words: Optional[List[str]] = None,
+    case_source_dir: Optional[str] = None,
 ) -> bool:
     """
     執行一個 P2P-Edit 案例的完整 7 phase 管線。
@@ -153,8 +494,38 @@ def run_one_case(
       • 以 PIE mask 等比例縮放作為各 scale 的 replacement mask
     成功回傳 True，失敗拋出例外。
     """
-    use_pie_mask = (mask_path is not None)
+    pie_mode = int(args.use_pie_mask) if (mask_path is not None) else 0
+    use_pie_mask = (pie_mode == 1)
+    use_pie_ratio_threshold = (pie_mode == 2)
     os.makedirs(save_dir, exist_ok=True)
+    ensure_case_reference_symlink(case_source_dir or '', save_dir)
+
+    attn_cache_enabled = bool(args.use_attn_cache) and int(args.attn_cache_max_scale) > 0
+    attn_cache_phase = args.attn_cache_phase if attn_cache_enabled else 'off'
+    attn_cache_apply_scales = set(range(min(int(args.attn_cache_max_scale), total_scales)))
+    attention_cache_root = os.path.join(save_dir, 'attention_cache')
+
+    cache_pairs: List[AttentionCachePair] = []
+    source_terms_to_export: Dict[str, List[int]] = {}
+    replacement_maps: Dict[int, Dict[int, Dict[int, torch.Tensor]]] = {}
+    if attn_cache_enabled:
+        cache_pairs, source_terms_to_export = build_attention_cache_pairs(
+            text_tokenizer=text_tokenizer,
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            blended_words=blended_words or [],
+        )
+        save_attention_cache_metadata(
+            save_dir=attention_cache_root,
+            cache_pairs=cache_pairs,
+            source_terms_to_export=source_terms_to_export,
+            args=args,
+            total_scales=total_scales,
+        )
+        print(
+            f"    [AttnCache] phase={attn_cache_phase}, scales=1~{min(int(args.attn_cache_max_scale), total_scales)}, "
+            f"replace_pairs={len(cache_pairs)}, export_terms={len(source_terms_to_export)}"
+        )
 
     source_focus_words_list = (
         [w for w in source_focus_words.split() if w] if source_focus_words.strip() else []
@@ -207,10 +578,11 @@ def run_one_case(
             for si in range(total_scales)
         ]
 
-    # ── 預先載入 PIE mask（各 scale，用於 Phase 1.6 + 1.9）──
+    # ── 預先載入 PIE mask（mode=1: 直接當 replacement；mode=2: 只取 white ratio）──
     pie_scale_masks: Dict[int, np.ndarray] = {}
     pie_mask_white_ratio: float = 0.0
     pie_mask_forced_off: bool = False
+    case_attn_threshold = float(args.attn_threshold_percentile)
     if use_pie_mask:
         pie_scale_masks, pie_mask_white_ratio = load_and_resize_pie_masks(
             mask_path, scale_schedule, args.num_full_replace_scales
@@ -224,15 +596,29 @@ def run_one_case(
                 f"    ⚠ PIE mask 白色比例過高 ({pie_mask_white_ratio * 100:.2f}%)，"
                 "改用 source/target attention mask"
             )
+    elif use_pie_ratio_threshold:
+        _, pie_mask_white_ratio = load_and_resize_pie_masks(
+            mask_path, scale_schedule, args.num_full_replace_scales
+        )
+        case_attn_threshold = map_white_ratio_to_threshold(
+            pie_mask_white_ratio, thr_min=65.0, thr_max=95.0
+        )
+        print(
+            f"    ℹ PIE ratio→threshold: white={pie_mask_white_ratio * 100:.2f}% "
+            f"-> attn_threshold_percentile={case_attn_threshold:.2f}"
+        )
 
     # ─────────────────────────────────────
     # Phase 1：Source 生成 + Attention 擷取
     # PIE mask 模式（純淨）：不需要 attention → 跳過 register_patches
     # PIE mask + attn_fallback 模式：仍需要 attention → 正常掛 hook
     # ─────────────────────────────────────
-    need_source_attn = source_focus_token_indices and (
-        not use_pie_mask or args.pie_mask_attn_fallback
-    )
+    use_full_p2p = attn_cache_enabled and getattr(args, 'attn_cache_align_mode', 'blended') == 'full_p2p'
+    need_source_attn = (
+        bool(source_focus_token_indices) and (
+            not use_pie_mask or args.pie_mask_attn_fallback or attn_cache_enabled
+        )
+    ) or use_full_p2p  # full_p2p 模式永遠需要 source attention
     p2p_token_storage = BitwiseTokenStorage(num_scales=total_scales, device='cpu')
 
     source_extractor = CrossAttentionExtractor(
@@ -274,6 +660,34 @@ def run_one_case(
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
     cv2.imwrite(os.path.join(save_dir, 'source.jpg'), img_np)
 
+    if attn_cache_enabled and source_extractor.attention_maps and source_terms_to_export:
+        replacement_maps, export_maps = build_attention_cache_from_source(
+            extractor=source_extractor,
+            cache_pairs=cache_pairs,
+            source_terms_to_export=source_terms_to_export,
+            scale_schedule=scale_schedule,
+            attn_block_indices=attn_block_indices,
+        )
+        save_attention_cache_maps(
+            export_maps=export_maps,
+            scale_schedule=scale_schedule,
+            save_root=os.path.join(attention_cache_root, 'source_terms'),
+        )
+
+    # ── Full P2P alignment（full_p2p 模式）──
+    full_p2p_alignment: Dict[int, int] = {}
+    if use_full_p2p and source_extractor.attention_maps:
+        full_p2p_alignment = build_full_p2p_alignment(
+            text_tokenizer=text_tokenizer,
+            source_prompt=source_prompt,
+            target_prompt=target_prompt,
+            blended_words=blended_words,
+        )
+        print(
+            f"    [FullP2P] alignment={len(full_p2p_alignment)} token pairs, "
+            f"scales=0~{min(int(args.attn_cache_max_scale), total_scales) - 1}"
+        )
+
     # ─────────────────────────────────────
     # Phase 1.5：Dual Attention Masks
     # 純淨 PIE mask 模式：跳過；fallback 模式：正常計算（用於二次篩選）
@@ -288,7 +702,7 @@ def run_one_case(
             scale_schedule=scale_schedule,
             num_full_replace_scales=args.num_full_replace_scales,
             attn_block_indices=attn_block_indices,
-            threshold_percentile=args.attn_threshold_percentile,
+            threshold_percentile=case_attn_threshold,
             label="source",
             low_attn=False,
         )
@@ -298,7 +712,7 @@ def run_one_case(
             scale_schedule=scale_schedule,
             num_full_replace_scales=args.num_full_replace_scales,
             attn_block_indices=attn_block_indices,
-            threshold_percentile=args.attn_threshold_percentile,
+            threshold_percentile=case_attn_threshold,
             label="source_preserve",
             low_attn=True,
         )
@@ -343,6 +757,13 @@ def run_one_case(
         use_pie_mask or bool(target_focus_token_indices)
     )
     if run_phase17:
+        use_phase17_attn_cache_blended = (
+            attn_cache_enabled and not use_full_p2p
+            and attn_cache_phase in ('phase17', 'both') and bool(replacement_maps)
+        )
+        use_phase17_full_p2p = (
+            use_full_p2p and attn_cache_phase in ('phase17', 'both') and bool(full_p2p_alignment)
+        )
         # PIE fallback 模式也需要 target attention；純淨 PIE 模式不需要
         need_target_attn = (
             not use_pie_mask or args.pie_mask_attn_fallback
@@ -352,9 +773,25 @@ def run_one_case(
             block_indices=attn_block_indices,
             batch_idx=args.attn_batch_idx,
             aggregate_method="mean",
-        ) if need_target_attn else None
-        if need_target_attn:
+            capture_attention=need_target_attn,
+            replacement_maps=replacement_maps if use_phase17_attn_cache_blended else None,
+            replace_scales=sorted(attn_cache_apply_scales) if use_phase17_attn_cache_blended else None,
+        ) if (need_target_attn or use_phase17_attn_cache_blended) else None
+        if target_extractor is not None:
             target_extractor.register_patches()
+
+        # Full P2P injector：套在 extractor 之上（後掛先卸）
+        phase17_injector: Optional[AttentionCacheInjector] = None
+        if use_phase17_full_p2p:
+            phase17_injector = AttentionCacheInjector(
+                model=infinity,
+                source_attention_maps=source_extractor.attention_maps,
+                block_indices=attn_block_indices,
+                token_alignment=full_p2p_alignment,
+                max_scale=min(int(args.attn_cache_max_scale), total_scales) - 1,
+                batch_idx=args.attn_batch_idx,
+            )
+            phase17_injector.register_patches()
 
         with autocast(dtype=torch.bfloat16):
             with torch.no_grad():
@@ -378,15 +815,19 @@ def run_one_case(
                     inject_schedule=None,
                 )
 
-        if need_target_attn:
+        # 卸載順序：先卸 injector（後掛先卸），再卸 extractor
+        if phase17_injector is not None:
+            phase17_injector.remove_patches()
+        if target_extractor is not None:
             target_extractor.remove_patches()
+        if need_target_attn and target_extractor is not None:
             target_text_masks = collect_attention_text_masks(
                 extractor=target_extractor,
                 focus_token_indices=target_focus_token_indices,
                 scale_schedule=scale_schedule,
                 num_full_replace_scales=args.num_full_replace_scales,
                 attn_block_indices=attn_block_indices,
-                threshold_percentile=args.attn_threshold_percentile,
+                threshold_percentile=case_attn_threshold,
                 label="target",
             )
         torch.cuda.empty_cache()
@@ -444,6 +885,12 @@ def run_one_case(
 
     for si_tok, tok in image_scale_tokens.items():
         p2p_token_storage.tokens[si_tok] = tok
+
+    # 每個 scale 的 replacement mask（True=保留 source）向外擴張
+    expand_storage_masks_inplace(
+        p2p_token_storage.masks,
+        expand_percent=float(args.mask_expand_percent),
+    )
 
     # ─────────────────────────────────────
     # Attention / Mask 視覺化（批量模式預設關閉）
@@ -507,6 +954,37 @@ def run_one_case(
     # Phase 2：Target 生成
     # ─────────────────────────────────────
     has_mask = len(p2p_token_storage.masks) > 0
+    phase2_attn_cache_blended = (
+        attn_cache_enabled and not use_full_p2p
+        and attn_cache_phase in ('phase2', 'both') and bool(replacement_maps)
+    )
+    phase2_full_p2p = (
+        use_full_p2p and attn_cache_phase in ('phase2', 'both') and bool(full_p2p_alignment)
+    )
+    phase2_extractor = CrossAttentionExtractor(
+        model=infinity,
+        block_indices=attn_block_indices,
+        batch_idx=args.attn_batch_idx,
+        aggregate_method="mean",
+        capture_attention=False,
+        replacement_maps=replacement_maps if phase2_attn_cache_blended else None,
+        replace_scales=sorted(attn_cache_apply_scales) if phase2_attn_cache_blended else None,
+    ) if phase2_attn_cache_blended else None
+    if phase2_extractor is not None:
+        phase2_extractor.register_patches()
+
+    # Full P2P injector for Phase 2
+    phase2_injector: Optional[AttentionCacheInjector] = None
+    if phase2_full_p2p:
+        phase2_injector = AttentionCacheInjector(
+            model=infinity,
+            source_attention_maps=source_extractor.attention_maps,
+            block_indices=attn_block_indices,
+            token_alignment=full_p2p_alignment,
+            max_scale=min(int(args.attn_cache_max_scale), total_scales) - 1,
+            batch_idx=args.attn_batch_idx,
+        )
+        phase2_injector.register_patches()
 
     with autocast(dtype=torch.bfloat16):
         with torch.no_grad():
@@ -529,6 +1007,12 @@ def run_one_case(
                 inject_image_features=None,
                 inject_schedule=None,
             )
+
+    # 卸載順序：先卸 injector，再卸 extractor
+    if phase2_injector is not None:
+        phase2_injector.remove_patches()
+    if phase2_extractor is not None:
+        phase2_extractor.remove_patches()
 
     img_np = target_image.cpu().numpy()
     if img_np.dtype != np.uint8:
@@ -587,14 +1071,29 @@ def main() -> None:
                         help='前幾個 scale 使用 source image 注入')
     parser.add_argument('--inject_weights', type=str, default='',
                         help='各 scale 注入強度（空格分隔）。預設由 image_injection_scales 生成')
-    parser.add_argument('--use_pie_mask', type=int, default=0, choices=[0, 1],
-                        help='使用 PIE-Bench 提供的 mask.png 作為 token 篩選遮罩（1=開啟）'
-                             '。開啟時以 mask 決定編輯/保留區域。')
+    parser.add_argument('--use_pie_mask', type=int, default=0, choices=[0, 1, 2],
+                        help='PIE mask 使用模式：0=關閉、1=直接作為 replacement mask、'
+                            '2=僅用白色比例反推 attn_threshold_percentile（65~92 反向線性）。')
     parser.add_argument('--pie_mask_attn_fallback', type=int, default=0, choices=[0, 1],
                         help='（需 use_pie_mask=1）在白色（編輯）區域內，'
                              '以 attention mask 二次篩選「真正需要編輯」的 token；'
                              '白色區域中 attention 未聚焦的 token 仍保留 source。'
                              '組合公式：final_mask = pie_bg OR attn_replacement')
+    parser.add_argument('--mask_expand_percent', type=float, default=0.0,
+                        help='每個 scale 對最終 replacement mask 向外擴張 True 區域的比例（%% of min(H,W)）。')
+    parser.add_argument('--use_attn_cache', type=int, default=0, choices=[0, 1],
+                        help='是否啟用 blended_words 對齊的 attention cache / replace（Prompt-to-Prompt 風格）。')
+    parser.add_argument('--attn_cache_phase', type=str, default='phase2',
+                        choices=['phase17', 'phase2', 'both'],
+                        help='在哪個 target generation phase 套用 attention cache。')
+    parser.add_argument('--attn_cache_max_scale', type=int, default=13,
+                        help='從 scale1 開始，最多套用到第幾個 scale（1-based；需 >0 才會生效）。')
+    parser.add_argument('--attn_cache_align_mode', type=str, default='blended',
+                        choices=['blended', 'full_p2p'],
+                        help='Attention cache 對齊模式：'
+                             'blended = 僅 blended_words 指定的 token 做替換（現有行為）；'
+                             'full_p2p = 完整 Prompt-to-Prompt 對齊'
+                             '（所有共同 token + swap token 都注入 source attention）。')
 
     args = parser.parse_args()
 
@@ -602,6 +1101,10 @@ def main() -> None:
     args.cfg = list(map(float, args.cfg.split(',')))
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
+    if args.mask_expand_percent < 0:
+        raise ValueError('--mask_expand_percent 必須 >= 0')
+    if args.attn_cache_max_scale < 0:
+        raise ValueError('--attn_cache_max_scale 必須 >= 0')
 
     print('\n' + '=' * 80)
     print('PIE-Bench 批量 P2P-Edit 評估')
@@ -612,8 +1115,13 @@ def main() -> None:
     print(f'max_per_cat    : {args.max_per_cat if args.max_per_cat > 0 else "全部"}')
     print(f'full_replace   : {args.num_full_replace_scales} scales')
     print(f'attn_percentile: {args.attn_threshold_percentile}')
-    print(f'use_pie_mask   : {bool(args.use_pie_mask)}')
+    print(f'use_pie_mask   : {args.use_pie_mask} (0=off,1=direct,2=ratio->thr)')
     print(f'pie_attn_fallbk: {bool(args.pie_mask_attn_fallback)}')
+    print(f'mask_expand_pct: {args.mask_expand_percent}')
+    print(f'use_attn_cache : {bool(args.use_attn_cache)}')
+    print(f'attn_cache_ph  : {args.attn_cache_phase}')
+    print(f'attn_cache_max : {args.attn_cache_max_scale}')
+    print(f'attn_cache_mode: {args.attn_cache_align_mode}')
     print('=' * 80 + '\n')
 
     # ── 載入模型（只載入一次）──
@@ -692,6 +1200,7 @@ def main() -> None:
                 continue
 
             save_dir = os.path.join(args.output_dir, cat_name, case_id)
+            ensure_case_reference_symlink(case_dir, save_dir)
 
             # 跳過已處理案例（必須存在且大小 > 0，避免中途中斷的空檔被跳過）
             target_out = os.path.join(save_dir, 'target.jpg')
@@ -732,6 +1241,7 @@ def main() -> None:
                     print(f'    ⚠ mask.png 不存在，fallback 至 attention mask 模式')
 
             try:
+                t_start = time.time()
                 run_one_case(
                     infinity=infinity,
                     vae=vae,
@@ -749,10 +1259,17 @@ def main() -> None:
                     total_scales=total_scales,
                     device_cuda=device_cuda,
                     mask_path=pie_mask_path,
+                    blended_words=blended_words,
+                    case_source_dir=case_dir,
                 )
+                elapsed = time.time() - t_start
+                # 儲存 timing.json
+                timing_path = os.path.join(save_dir, 'timing.json')
+                with open(timing_path, 'w') as f_t:
+                    json.dump({'inference_sec': round(elapsed, 3)}, f_t)
                 cat_done  += 1
                 total_done += 1
-                print(f'    ✓  → {save_dir}/target.jpg')
+                print(f'    ✓  → {save_dir}/target.jpg  ({elapsed:.1f}s)')
 
             except Exception as exc:
                 cat_err  += 1

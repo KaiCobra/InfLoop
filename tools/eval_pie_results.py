@@ -10,10 +10,14 @@ eval_pie_results.py — PIE-Bench 結果定量評估腳本
     • LPIPS           — ↓，比較 source vs edited 的背景區域
 
   結構保留（Structure Preservation）：
-    • Structure Dist  — ↓，DINO ViT-S/8 key-feature MSE（source vs edited 全圖）
+    • Structure Dist  — ↓，DINO ViT-B/8 key self-similarity MSE（source vs edited 全圖）
 
   編輯品質（Edit Quality）：
-    • CLIP sim（image-text）— ↑，edited image vs target_prompt
+    • CLIP sim whole  — ↑，edited image 全圖 vs target_prompt
+    • CLIP sim edited — ↑，edited image 編輯區域 vs target_prompt
+
+  推論速度（Inference Speed）：
+    • inference_sec   — 每張圖推論秒數（從 timing.json 讀取）
 
   遮罩規則：
     mask.png = 255（白色）→ 編輯區域（排除在背景指標之外）
@@ -227,58 +231,70 @@ class CLIPCalculator:
         txt_emb  = self.text_embedding(text)
         return float((img_emb * txt_emb).sum().item())
 
+    def similarity_edited(self, img_rgb: np.ndarray, text: str,
+                           edit_mask: np.ndarray) -> float:
+        """
+        只保留編輯區域（edit_mask=True），背景設為黑色，再計算 CLIP 相似度。
+        與 PnPInversion 官方做法一致：img * mask → CLIP score。
+        """
+        masked_img = img_rgb.copy()
+        masked_img[~edit_mask] = 0  # 背景設為黑色
+        return self.similarity(masked_img, text)
+
 
 # ============================================================
-# Structure Distance（DINO ViT-S/8 Key MSE）
+# Structure Distance（DINO ViT-B/8 Key Self-Similarity MSE）
 # ============================================================
 
 class DINOStructureCalculator:
     """
-    Structure Distance（PIE-Bench paper 採用的指標）。
-    使用 DINO ViT-S/8 最後一個 block 的 key features，
-    計算 source image 與 edited image 之間的 MSE。
-    越低表示結構保留越好。
+    Structure Distance（PIE-Bench / PnPInversion 官方指標）。
+    使用 DINO ViT-B/8 第 11 層（最後一個 block）的 key features，
+    計算 cosine self-similarity matrix，再對 source 與 edited 的
+    self-similarity matrix 取 MSE。越低表示結構保留越好。
+
+    參考：https://github.com/cure-lab/PnPInversion/blob/main/evaluation/matrics_calculator.py
     """
 
     _IMAGENET_MEAN = [0.485, 0.456, 0.406]
     _IMAGENET_STD  = [0.229, 0.224, 0.225]
     _INPUT_SIZE    = 224
+    _LAYER_NUM     = 11  # 官方使用 layer 11（ViT-B 共 12 層，0-indexed）
 
     def __init__(self, device: torch.device = torch.device('cpu')):
         self.device = device
-        print('  [DINO] 載入 DINO ViT-S/8 (facebookresearch/dino)...')
+        print('  [DINO] 載入 DINO ViT-B/8 (facebookresearch/dino)...')
         self.model = torch.hub.load(
-            'facebookresearch/dino:main', 'dino_vits8', verbose=False
+            'facebookresearch/dino:main', 'dino_vitb8', verbose=False
         ).to(device).eval()
+        self.num_heads = self.model.blocks[self._LAYER_NUM].attn.num_heads
 
-        transforms, InterpolationMode = _require_torchvision_transforms()
+        transforms, _ = _require_torchvision_transforms()
         self.transform = transforms.Compose([
-            transforms.Resize(self._INPUT_SIZE,
-                              interpolation=InterpolationMode.BICUBIC),
-            transforms.CenterCrop(self._INPUT_SIZE),
+            transforms.Resize(self._INPUT_SIZE, max_size=480),
             transforms.ToTensor(),
             transforms.Normalize(mean=self._IMAGENET_MEAN,
                                  std=self._IMAGENET_STD),
         ])
-        print('  [DINO] 載入完成')
+        print(f'  [DINO] 載入完成 (num_heads={self.num_heads})')
 
     def _extract_keys(self, img_rgb: np.ndarray) -> torch.Tensor:
         """
-        Hook DINO 最後一個 block 的 qkv 線性層，取出 key features。
-        回傳 Tensor [num_heads * N * head_dim]，已 flatten。
+        Hook DINO 第 11 層 block 的 qkv 線性層，取出 key features。
+        回傳 Tensor [1, num_heads, N, head_dim]。
         """
         saved: Dict[str, torch.Tensor] = {}
 
         def _hook(module, input, output):
-            # output: [1, N, 3*embed_dim]  (N = num_patches + 1)
+            # output: [B, N, 3*embed_dim]  (N = num_patches + 1)
             B, N, three_d = output.shape
-            num_heads = self.model.blocks[-1].attn.num_heads
+            num_heads = self.num_heads
             head_dim  = three_d // (3 * num_heads)
             # reshape → [3, B, num_heads, N, head_dim]
             qkv = output.reshape(B, N, 3, num_heads, head_dim).permute(2, 0, 3, 1, 4)
-            saved['k'] = qkv[1].flatten().detach()  # keys
+            saved['k'] = qkv[1].detach()  # keys: [B, num_heads, N, head_dim]
 
-        handle = self.model.blocks[-1].attn.qkv.register_forward_hook(_hook)
+        handle = self.model.blocks[self._LAYER_NUM].attn.qkv.register_forward_hook(_hook)
         pil_img = Image.fromarray(img_rgb)
         t = self.transform(pil_img).unsqueeze(0).to(self.device)
         with torch.no_grad():
@@ -286,15 +302,33 @@ class DINOStructureCalculator:
         handle.remove()
         return saved['k']
 
+    @staticmethod
+    def _keys_self_similarity(keys: torch.Tensor) -> torch.Tensor:
+        """
+        計算 key features 的 cosine self-similarity matrix。
+        keys: [B, num_heads, N, head_dim]
+        回傳: [B, N, N] cosine similarity matrix
+        """
+        B, h, N, d = keys.shape
+        # 合併所有 head 的 key：[B, N, h*d]
+        concat = keys.permute(0, 2, 1, 3).reshape(B, N, h * d)
+        # Cosine self-similarity
+        norm = concat.norm(dim=2, keepdim=True)          # [B, N, 1]
+        factor = torch.clamp(norm @ norm.transpose(1, 2), min=1e-8)  # [B, N, N]
+        sim = (concat @ concat.transpose(1, 2)) / factor  # [B, N, N]
+        return sim
+
     @torch.no_grad()
     def compute(self, img_src: np.ndarray, img_tgt: np.ndarray) -> float:
         """
         img_src, img_tgt: [H, W, 3] uint8
-        回傳 structure distance（MSE of DINO keys）↓ 越低越好
+        回傳 structure distance（MSE of DINO key self-similarity）↓ 越低越好
         """
         k_src = self._extract_keys(img_src)
         k_tgt = self._extract_keys(img_tgt)
-        return float(((k_src - k_tgt) ** 2).mean().item())
+        sim_src = self._keys_self_similarity(k_src)
+        sim_tgt = self._keys_self_similarity(k_tgt)
+        return float(torch.nn.functional.mse_loss(sim_tgt, sim_src).item())
 
 
 # ============================================================
@@ -325,7 +359,7 @@ def evaluate_all(
 
     dino_calc: Optional[DINOStructureCalculator] = None
     if not no_structure_dist:
-        print('[Init] 載入 DINO ViT-S/8 模型...')
+        print('[Init] 載入 DINO ViT-B/8 模型...')
         dino_calc = DINOStructureCalculator(device=device)
 
     # ── CSV 標頭 ──
@@ -334,7 +368,8 @@ def evaluate_all(
         'category', 'case_id', 'edit_action',
         'psnr', 'ssim', 'lpips',
         'structure_dist',
-        'clip_sim',
+        'clip_sim_whole', 'clip_sim_edited',
+        'inference_sec',
         'bg_pixel_pct',   # 背景像素佔比（%）
     ]
 
@@ -415,22 +450,37 @@ def evaluate_all(
             ssim_val  = ssim_masked(src_img, target_img, bg_mask)
             lpips_val = lpips_calc.compute(src_img, target_img, bg_mask)
 
-            # ── Structure Distance（DINO keys MSE，整張圖 source vs target）──
+            # ── Structure Distance（DINO keys self-similarity MSE，整張圖 source vs target）──
             struct_val = dino_calc.compute(src_img, target_img) if dino_calc else float('nan')
 
-            # ── CLIP 相似度（整張 target 圖 vs target_prompt）──
-            clip_val  = clip_calc.similarity(target_img, target_prompt)
+            # ── CLIP 相似度 ──
+            clip_whole_val  = clip_calc.similarity(target_img, target_prompt)
+            clip_edited_val = clip_calc.similarity_edited(target_img, target_prompt, edit_mask)
+
+            # ── Inference Speed（從 timing.json 讀取）──
+            timing_path = os.path.join(result_case, 'timing.json')
+            if os.path.exists(timing_path):
+                try:
+                    with open(timing_path, 'r', encoding='utf-8') as f_t:
+                        timing_data = json.load(f_t)
+                    inference_sec = float(timing_data.get('inference_sec', float('nan')))
+                except Exception:
+                    inference_sec = float('nan')
+            else:
+                inference_sec = float('nan')
 
             row = {
-                'category'      : cat_name,
-                'case_id'       : case_id,
-                'edit_action'   : edit_action,
-                'psnr'          : round(psnr_val,    4) if not np.isnan(psnr_val)    else 'nan',
-                'ssim'          : round(ssim_val,    4) if not np.isnan(ssim_val)    else 'nan',
-                'lpips'         : round(lpips_val,   4) if not np.isnan(lpips_val)   else 'nan',
-                'structure_dist': round(struct_val,  6) if not np.isnan(struct_val)  else 'nan',
-                'clip_sim'      : round(clip_val,    4),
-                'bg_pixel_pct'  : round(bg_pct, 2),
+                'category'       : cat_name,
+                'case_id'        : case_id,
+                'edit_action'    : edit_action,
+                'psnr'           : round(psnr_val,         4) if not np.isnan(psnr_val)        else 'nan',
+                'ssim'           : round(ssim_val,         4) if not np.isnan(ssim_val)        else 'nan',
+                'lpips'          : round(lpips_val,        4) if not np.isnan(lpips_val)       else 'nan',
+                'structure_dist' : round(struct_val,       6) if not np.isnan(struct_val)      else 'nan',
+                'clip_sim_whole' : round(clip_whole_val,   4),
+                'clip_sim_edited': round(clip_edited_val,  4),
+                'inference_sec'  : round(inference_sec,    3) if not np.isnan(inference_sec)   else 'nan',
+                'bg_pixel_pct'   : round(bg_pct, 2),
             }
             all_rows.append(row)
             cat_rows.append(row)
@@ -439,10 +489,12 @@ def evaluate_all(
             ssim_str   = f'{ssim_val:.4f}'   if not np.isnan(ssim_val)   else '  NaN  '
             lpips_str  = f'{lpips_val:.4f}'  if not np.isnan(lpips_val)  else '  NaN  '
             struct_str = f'{struct_val:.6f}' if not np.isnan(struct_val) else '  NaN  '
+            infer_str  = f'{inference_sec:.1f}s' if not np.isnan(inference_sec) else ' N/A '
             print(f'  [{idx+1:3d}/{len(case_ids)}] {case_id}'
                   f'  PSNR={psnr_str}  SSIM={ssim_str}'
-                  f'  LPIPS={lpips_str}  Sdist={struct_str}  CLIP={clip_val:.4f}'
-                  f'  bg={bg_pct:.0f}%')
+                  f'  LPIPS={lpips_str}  Sdist={struct_str}'
+                  f'  CLIPw={clip_whole_val:.4f}  CLIPe={clip_edited_val:.4f}'
+                  f'  t={infer_str}  bg={bg_pct:.0f}%')
 
         cat_stats[cat_name] = cat_rows
         _print_category_summary(cat_name, cat_rows)
@@ -482,23 +534,27 @@ def _build_summary(cat_stats: Dict[str, List[Dict]]) -> Dict:
         all_rows_flat.extend(rows)
         has_bg = [r for r in rows if r['bg_pixel_pct'] > 0]
         summary[cat_name] = {
-            'n_cases'           : len(rows),
-            'n_with_bg'         : len(has_bg),
-            'psnr_mean'         : _nanmean([r['psnr']           for r in rows]),
-            'ssim_mean'         : _nanmean([r['ssim']           for r in rows]),
-            'lpips_mean'        : _nanmean([r['lpips']          for r in rows]),
-            'structure_dist_mean': _nanmean([r['structure_dist'] for r in rows]),
-            'clip_sim_mean'     : _nanmean([r['clip_sim']       for r in rows]),
+            'n_cases'              : len(rows),
+            'n_with_bg'            : len(has_bg),
+            'psnr_mean'            : _nanmean([r['psnr']            for r in rows]),
+            'ssim_mean'            : _nanmean([r['ssim']            for r in rows]),
+            'lpips_mean'           : _nanmean([r['lpips']           for r in rows]),
+            'structure_dist_mean'  : _nanmean([r['structure_dist']  for r in rows]),
+            'clip_sim_whole_mean'  : _nanmean([r['clip_sim_whole']  for r in rows]),
+            'clip_sim_edited_mean' : _nanmean([r['clip_sim_edited'] for r in rows]),
+            'inference_sec_mean'   : _nanmean([r['inference_sec']   for r in rows]),
         }
 
     # 全域平均
     summary['__overall__'] = {
-        'n_cases'           : len(all_rows_flat),
-        'psnr_mean'         : _nanmean([r['psnr']           for r in all_rows_flat]),
-        'ssim_mean'         : _nanmean([r['ssim']           for r in all_rows_flat]),
-        'lpips_mean'        : _nanmean([r['lpips']          for r in all_rows_flat]),
-        'structure_dist_mean': _nanmean([r['structure_dist'] for r in all_rows_flat]),
-        'clip_sim_mean'     : _nanmean([r['clip_sim']       for r in all_rows_flat]),
+        'n_cases'              : len(all_rows_flat),
+        'psnr_mean'            : _nanmean([r['psnr']            for r in all_rows_flat]),
+        'ssim_mean'            : _nanmean([r['ssim']            for r in all_rows_flat]),
+        'lpips_mean'           : _nanmean([r['lpips']           for r in all_rows_flat]),
+        'structure_dist_mean'  : _nanmean([r['structure_dist']  for r in all_rows_flat]),
+        'clip_sim_whole_mean'  : _nanmean([r['clip_sim_whole']  for r in all_rows_flat]),
+        'clip_sim_edited_mean' : _nanmean([r['clip_sim_edited'] for r in all_rows_flat]),
+        'inference_sec_mean'   : _nanmean([r['inference_sec']   for r in all_rows_flat]),
     }
     return summary
 
@@ -506,18 +562,22 @@ def _build_summary(cat_stats: Dict[str, List[Dict]]) -> Dict:
 def _print_category_summary(cat_name: str, rows: List[Dict]) -> None:
     if not rows:
         return
-    psnr_m   = _nanmean([r['psnr']           for r in rows])
-    ssim_m   = _nanmean([r['ssim']           for r in rows])
-    lpips_m  = _nanmean([r['lpips']          for r in rows])
-    struct_m = _nanmean([r['structure_dist'] for r in rows])
-    clip_m   = _nanmean([r['clip_sim']       for r in rows])
-    n_bg     = sum(1 for r in rows if r['bg_pixel_pct'] > 0)
+    psnr_m    = _nanmean([r['psnr']            for r in rows])
+    ssim_m    = _nanmean([r['ssim']            for r in rows])
+    lpips_m   = _nanmean([r['lpips']           for r in rows])
+    struct_m  = _nanmean([r['structure_dist']  for r in rows])
+    clipw_m   = _nanmean([r['clip_sim_whole']  for r in rows])
+    clipe_m   = _nanmean([r['clip_sim_edited'] for r in rows])
+    infer_m   = _nanmean([r['inference_sec']   for r in rows])
+    n_bg      = sum(1 for r in rows if r['bg_pixel_pct'] > 0)
 
     def fmt4(v): return f'{v:.4f}' if v is not None else '  N/A  '
     def fmt6(v): return f'{v:.6f}' if v is not None else '    N/A   '
+    def fmts(v): return f'{v:.1f}s' if v is not None else '  N/A '
     print(f'\n  ┌── {cat_name} 小計 ({len(rows)} cases, {n_bg} w/ background) ──')
     print(f'  │  PSNR={fmt4(psnr_m)}  SSIM={fmt4(ssim_m)}  LPIPS={fmt4(lpips_m)}')
-    print(f'  │  StructDist={fmt6(struct_m)}  CLIP={fmt4(clip_m)}')
+    print(f'  │  StructDist={fmt6(struct_m)}  CLIPwhole={fmt4(clipw_m)}  CLIPedited={fmt4(clipe_m)}')
+    print(f'  │  InferSpeed={fmts(infer_m)}')
     print(f'  └{"─" * 60}')
 
 
@@ -525,12 +585,13 @@ def _print_global_summary(summary: Dict) -> None:
     ov = summary.get('__overall__', {})
     def fmt4(v): return f'{v:.4f}' if v is not None else '  N/A '
     def fmt6(v): return f'{v:.6f}' if v is not None else '   N/A  '
+    def fmts(v): return f'{v:.1f}s' if v is not None else ' N/A '
 
-    W = 88
+    W = 108
     print('\n' + '=' * W)
     print(f'{"全域評估摘要":^{W}}')
     print('=' * W)
-    print(f'{"Category":<38} {"PSNR":>7} {"SSIM":>7} {"LPIPS":>7} {"StructDist":>11} {"CLIP":>7}')
+    print(f'{"Category":<38} {"PSNR":>7} {"SSIM":>7} {"LPIPS":>7} {"StructDist":>11} {"CLIPw":>7} {"CLIPe":>7} {"Speed":>7}')
     print('─' * W)
     for cat, s in summary.items():
         if cat == '__overall__':
@@ -539,17 +600,22 @@ def _print_global_summary(summary: Dict) -> None:
         q  = fmt4(s.get('ssim_mean'))
         r  = fmt4(s.get('lpips_mean'))
         sd = fmt6(s.get('structure_dist_mean'))
-        c  = fmt4(s.get('clip_sim_mean'))
-        print(f'{cat:<38} {p:>7} {q:>7} {r:>7} {sd:>11} {c:>7}')
+        cw = fmt4(s.get('clip_sim_whole_mean'))
+        ce = fmt4(s.get('clip_sim_edited_mean'))
+        sp = fmts(s.get('inference_sec_mean'))
+        print(f'{cat:<38} {p:>7} {q:>7} {r:>7} {sd:>11} {cw:>7} {ce:>7} {sp:>7}')
     print('─' * W)
     print(f'{"Overall":<38} {fmt4(ov.get("psnr_mean")):>7} '
           f'{fmt4(ov.get("ssim_mean")):>7} '
           f'{fmt4(ov.get("lpips_mean")):>7} '
           f'{fmt6(ov.get("structure_dist_mean")):>11} '
-          f'{fmt4(ov.get("clip_sim_mean")):>7}')
+          f'{fmt4(ov.get("clip_sim_whole_mean")):>7} '
+          f'{fmt4(ov.get("clip_sim_edited_mean")):>7} '
+          f'{fmts(ov.get("inference_sec_mean")):>7}')
     print('=' * W)
     print(f'  總案例數：{ov.get("n_cases", 0)}')
-    print(f'  指標說明：PSNR/SSIM ↑（背景保留），LPIPS ↓（背景），StructDist ↓（結構保留），CLIP ↑（編輯對齊）')
+    print(f'  指標說明：PSNR/SSIM ↑（背景保留），LPIPS ↓（背景），StructDist ↓（結構保留），'
+          f'CLIPw/CLIPe ↑（編輯對齊 whole/edited），Speed = 推論時間')
     print('=' * W + '\n')
 
 
@@ -559,7 +625,7 @@ def _print_global_summary(summary: Dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description='PIE-Bench 結果定量評估（PSNR / SSIM / LPIPS / Structure Dist / CLIP）'
+        description='PIE-Bench 結果定量評估（PSNR / SSIM / LPIPS / Structure Dist / CLIP whole+edited / Speed）'
     )
 
     # ── 路徑設定 ──
@@ -613,7 +679,7 @@ def main() -> None:
 
     print(f'[Config] {len(categories)} 個 category，max_per_cat={args.max_per_cat}')
     print(f'[Config] LPIPS={args.lpips_net}  CLIP={args.clip_model}/{args.clip_pretrained}')
-    print(f'[Config] StructureDist={"OFF" if args.no_structure_dist else "ON (DINO ViT-S/8)"}')
+    print(f'[Config] StructureDist={"OFF" if args.no_structure_dist else "ON (DINO ViT-B/8)"}')
 
     # ── 建立輸出目錄 ──
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)

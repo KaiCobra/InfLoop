@@ -51,7 +51,7 @@ p2p_token_replace_prob=0.0
 
 # ── 批量設定 ──
 bench_dir="./outputs/outputs_loop_exp/extracted_pie_bench"
-output_dir="./outputs/outputs_loop_exp/pie_bench_results_pieMask85"
+output_dir="./outputs/outputs_loop_exp/pie_bench_results_pieAttnCacheBoth10"
 
 # 只跑特定 category（逗號分隔資料夾名稱），留空白代表全部
 # 範例：categories="0_random_140,1_change_object_80"
@@ -67,14 +67,38 @@ skip_existing=1
 save_attn_vis=1
 
 # 是否使用 PIE-Bench 提供的 mask.png 做為 token 替換遮罩
-# 0 = 使用 attention threshold（預設）；1 = 使用 PIE mask
-use_pie_mask=0
+# 0 = 使用 attention threshold（預設）
+# 1 = 使用 PIE mask 直接作為 replacement mask
+# 2 = 使用 PIE mask 白色比例反推 attn_threshold_percentile（65~92 反向線性）
+use_pie_mask=2
 
 # （需 use_pie_mask=1）白色（編輯）區域內以 attention 二次篩選
 # 0 = 純 PIE mask（預設）；1 = PIE mask AND attention fallback
 # 邏輯：final_mask = pie_bg_mask OR attn_replacement_mask
 #   → 黑色區域全部保留 source；白色區域中 attention 未聚焦的 token 也保留 source
 pie_mask_attn_fallback=0
+
+# 每個 scale 的最終 replacement mask 向外擴張比例（% of min(H,W)）
+# 0 = 不擴張，建議先試 1~3
+mask_expand_percent=3
+
+# ── Prompt-to-Prompt 風格 Attention Cache ──
+# 0 = 關閉；1 = 開啟
+use_attn_cache=0
+
+# phase17 = 套在 Phase 1.7 target guided gen
+# phase2  = 套在 Phase 2 final target gen
+# both    = 兩個 phase 都套
+attn_cache_phase="both"
+
+# 從 scale1 開始，最多套用到第幾個 scale（1-based）
+# 13 = pn=1M 的全部 13 個 scale
+attn_cache_max_scale=6
+
+# Attention cache 對齊模式
+# blended  = 僅 blended_words 指定的 token 做替換（現有行為）
+# full_p2p = 完整 Prompt-to-Prompt 對齊（所有共同 token + swap token 都注入 source attention）
+attn_cache_align_mode="full_p2p"
 
 # 亂數種子
 seed=1
@@ -119,4 +143,9 @@ python3 tools/run_pie_edit.py \
   --skip_existing ${skip_existing} \
   --use_pie_mask ${use_pie_mask} \
   --pie_mask_attn_fallback ${pie_mask_attn_fallback} \
+  --mask_expand_percent ${mask_expand_percent} \
+  --use_attn_cache ${use_attn_cache} \
+  --attn_cache_phase ${attn_cache_phase} \
+  --attn_cache_max_scale ${attn_cache_max_scale} \
+  --attn_cache_align_mode ${attn_cache_align_mode} \
   --seed ${seed}

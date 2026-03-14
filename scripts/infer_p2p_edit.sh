@@ -122,6 +122,11 @@ target_prompt="A oil paint of a Green Frog in a blue suit speaking at a micropho
 source_focus_words="photo confident politician"
 target_focus_words="oil paint Green Frog"
 
+source_prompt="A photo of Pimples"
+target_prompt="A photo of "
+source_focus_words="A photo of "
+target_focus_words=""
+
 # ── 其他範例 ──
 
 # source_prompt="Cute Shiba Inu wearing a space helmet and pink T-shirt in a bedroom holding a sign reads \"GET OUT\"."

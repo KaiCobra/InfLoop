@@ -31,9 +31,9 @@ pip install -q lpips open-clip-torch
 
 # ── 路徑設定 ──
 bench_dir="./outputs/outputs_loop_exp/extracted_pie_bench"
-result_dir="./outputs/outputs_loop_exp/pie_bench_results_pieMask"
-output_csv="./outputs/eval_pieMask/per_case.csv"
-summary_json="./outputs/eval_pieMask/summary.json"
+result_dir="outputs/outputs_loop_exp/pie_bench_results_pieMaskRatio"
+output_csv="./outputs/eval_pieMaskRatio/per_case.csv"
+summary_json="./outputs/eval_pieMaskRatio/summary.json"
 
 # ── 過濾設定 ──
 # 只評估指定 category（逗號分隔），留空白代表全部
