@@ -68,6 +68,7 @@ p2p_token_file="./tokens_p2p_attn.pkl"
 
 # 是否儲存 attention 遮罩視覺化（白色 = 替換區域，黑色 = 文字區域）
 save_attn_vis=1
+use_normalized_attn=0
 
 # ── Prompt 設定 ──
 # 注意：focus_words 應為 source_prompt 中「與 target 不同的文字內容」
@@ -117,15 +118,15 @@ target_prompt="A smiling girl, facial features extreme close up."
 # source_prompt="A oil painting of a dog laying down on the ground."
 # target_prompt="A real photographic of a dog laying down on the ground."
 
-source_prompt="A portrait of a young woman standing in a sunflower field, warm sunlight coming from the left side."
-target_prompt="A portrait of a young woman standing in a sunflower field, warm sunlight coming from the right side."
+# source_prompt="A portrait of a young woman standing in a sunflower field, warm sunlight coming from the left side."
+# target_prompt="A portrait of a young woman standing in a sunflower field, warm sunlight coming from the right side."
 
 # source_focus_words / target_focus_words
 # 說明：兩者分別指定各自 prompt 中與目標物件對應的詞彙。
 #   - 高 attention 區域（focus）將不被 source token 覆蓋
 #   - source + target focus mask 取 union，確保兩張圖的物件區域都受保護
-source_focus_words="sunlight coming from the left side"
-target_focus_words="sunlight coming from the right side"
+# source_focus_words="sunlight coming from the left side"
+# target_focus_words="sunlight coming from the right side"
 
 # source_prompt="A photograph of a cat playing a guitar at a cozy street café terrace."
 # target_prompt="A photograph of a fox playing a guitar at a cozy street café terrace."
@@ -166,5 +167,6 @@ python3 tools/run_p2p_attn.py \
   --p2p_token_replace_prob ${p2p_token_replace_prob} \
   --p2p_token_file ${p2p_token_file} \
   --save_attn_vis ${save_attn_vis} \
+  --use_normalized_attn ${use_normalized_attn} \
   --save_file ${save_file} \
   --seed 1

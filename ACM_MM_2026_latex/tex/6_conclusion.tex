@@ -1,0 +1,7 @@
+\section{Conclusion}
+\label{section:conclusion}
+
+We present an \textit{understanding-before-editing} framework, a training-free, inversion-free approach that brings attention-driven spatial control to Visual Autoregressive Models. Our key observation is that cross-attention maps in VAR transformers encode fine-grained spatial semantics sufficient for mask construction, eliminating the need for external segmentation, per-category tuning, or latent inversion. By combining IQR-filtered attention aggregation with adaptive binary-search thresholding, our method derives precise editing masks at each scale and selectively replaces only background tokens with lossless BSQ-VAE codes. Experiments on PIE-Bench demonstrate that a 2B-parameter VAR model achieves state-of-the-art background preservation and competitive editing quality, surpassing both diffusion-based and 12B flow-based baselines in 2.11\,s on a single GPU. We hope our findings demonstrate the viability of attention-based editing beyond diffusion paradigms and inspire further exploration of training-free manipulation in autoregressive visual generation.
+
+\noindent\textbf{Limitations.}
+Our method inherits the capabilities and resolution constraints of the underlying VAR model; editing quality on fine textures is bounded by the base model's fidelity. When source and target prompts require substantial geometric changes (e.g., altering pose or layout), coarse-scale structural anchoring can conflict with the desired edit, as VAR commits to global structure in the earliest scales.

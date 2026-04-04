@@ -24,7 +24,7 @@ text_channels=2048
 apply_spatial_patchify=0
 
 # P2P specific parameters
-num_source_scales=4              # Number of scales to extract tokens from source
+num_source_scales=8              # Number of scales to extract tokens from source
 p2p_token_replace_prob=1       # Probability of replacing target tokens with source tokens
 p2p_token_file="./tokens_p2p.pkl"  # File to save/load extracted tokens
 

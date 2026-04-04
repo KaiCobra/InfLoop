@@ -1,0 +1,20 @@
+\section{Algorithm Details}
+\label{sec:supp_algorithms}
+
+\subsection{Dynamic Mask Thresholding via Binary Search}
+\label{sec:supp_dynamic_threshold}
+
+When an external reference mask $M_{\mathrm{ref}}$ is available (e.g., PIE-Bench ground-truth segmentation masks), we automatically determine the binarization threshold $\tau_k$ via binary search, rather than using a fixed percentile. The criterion is that the attention-derived mask should exhibit higher coverage \emph{inside} the reference region than \emph{outside}.
+
+Concretely, let $\hat{a}_k^{\uparrow}$ denote the filtered attention map $\hat{a}_k$ resized to the spatial resolution of $M_{\mathrm{ref}}$. At each binary search step, we construct a candidate mask $M_{\mathrm{cand}} = \mathbb{1}[\hat{a}_k^{\uparrow} \geq \tau_{\mathrm{mid}}]$ and measure the inside/outside coverage ratios:
+\EqCoverageRatio
+If $r_{\mathrm{in}} > r_{\mathrm{out}}$, the mask is still concentrated inside the reference region — we tighten the threshold ($\tau_{\mathrm{lo}} \leftarrow \tau_{\mathrm{mid}}$). Otherwise, we relax it ($\tau_{\mathrm{hi}} \leftarrow \tau_{\mathrm{mid}}$). The search converges to the maximum threshold $\tau^*$ at which the mask still concentrates within the editing region, avoiding both over-segmentation (threshold too low, leaks into background) and under-segmentation (threshold too high, misses the target). The procedure is given in Algorithm~\ref{alg:dynamic_threshold} below.
+
+\input{equations/algor1}
+
+\subsection{Complete Editing Pipeline}
+\label{sec:supp_pipeline}
+
+Algorithm~\ref{alg:editing} gives the full three-phase procedure corresponding to Section~4.3 in the main text.
+
+\input{equations/algor2}

@@ -28,12 +28,12 @@
 # ── 自動安裝評估套件 ──
 echo "[Setup] 檢查並安裝評估套件..."
 pip install -q lpips open-clip-torch
-
+num_full_replace_scales=6
 # ── 路徑設定 ──
-bench_dir="./outputs/outputs_loop_exp/extracted_pie_bench"
-result_dir="outputs/outputs_loop_exp/pie_bench_results_pieMaskRatio"
-output_csv="./outputs/eval_pieMaskRatio/per_case.csv"
-summary_json="./outputs/eval_pieMaskRatio/summary.json"
+bench_dir="./outputs/outputs_loop_exp/PIE-Bench_v1-20260314T125823Z-3-001/PIE-Bench_v1"
+result_dir="./outputs/outputs_loop_exp/pie_bench_correctedResults60Threshold_5090_ablation_${num_full_replace_scales}"
+output_csv="./outputs/eval_pie_bench_correctedResults60Threshold_5090_ablation_${num_full_replace_scales}/per_case.csv"
+summary_json="./outputs/eval_pie_bench_correctedResults60Threshold_5090_ablation_${num_full_replace_scales}/summary.json"
 
 # ── 過濾設定 ──
 # 只評估指定 category（逗號分隔），留空白代表全部

@@ -38,9 +38,16 @@ if _ROOT not in sys.path:
 
 from tools.run_p2p_edit import (
     find_focus_token_indices,
+    derive_focus_terms_from_prompt_diff,
+    parse_focus_words_arg,
     _iqr_filtered_mean,
     collect_attention_text_masks,
+    collect_attention_text_masks_dynamic,
+    collect_last_scale_attention_mask,
     combine_and_store_masks,
+    build_cumulative_replacement_prob_masks,
+    _mask_tensor_to_prob_map,
+    _save_prob_masks_to_dir,
     _save_masks_to_dir,
     gen_one_img,
     encode_image_to_raw_features,
@@ -58,6 +65,22 @@ from attention_map.extractor import CrossAttentionExtractor, AttentionCacheInjec
 # ============================================================
 # 工具函式
 # ============================================================
+
+def decode_rle_mask(rle: List[int], hw: Tuple[int, int] = (512, 512)) -> np.ndarray:
+    """
+    解碼 PIE-Bench mapping_file.json 中的 mask RLE。
+    格式：(start, count) 交替排列，foreground=True。
+    回傳 bool 陣列 [H, W]，True = 編輯區域。
+    """
+    h, w = hw
+    flat = np.zeros(h * w, dtype=np.uint8)
+    for i in range(0, len(rle), 2):
+        start = rle[i]
+        count = rle[i + 1]
+        end = min(start + count, h * w)
+        flat[start:end] = 1
+    return flat.reshape(h, w).astype(bool)
+
 
 def clean_target_prompt(prompt: str) -> str:
     """
@@ -186,6 +209,7 @@ def build_attention_cache_from_source(
     source_terms_to_export: Dict[str, List[int]],
     scale_schedule: List[Tuple[int, int, int]],
     attn_block_indices: List[int],
+    use_iqr_filter: bool = True,
 ) -> Tuple[Dict[int, Dict[int, Dict[int, torch.Tensor]]], Dict[str, Dict[int, np.ndarray]]]:
     """
     從 source 生成得到的 attention maps 建立：
@@ -228,7 +252,8 @@ def build_attention_cache_from_source(
             if not block_maps:
                 continue
             filtered_attn, _, _ = _iqr_filtered_mean(
-                torch.tensor(np.stack(block_maps), dtype=torch.float32)
+                torch.tensor(np.stack(block_maps), dtype=torch.float32),
+                use_iqr_filter=use_iqr_filter,
             )
             export_maps[term][scale_idx] = filtered_attn.astype(np.float32)
 
@@ -360,6 +385,110 @@ def map_white_ratio_to_threshold(
     return float(np.clip(threshold, thr_min, thr_max))
 
 
+def build_final_overlay_mask_from_storage(
+    storage_masks: Dict[int, torch.Tensor],
+    scale_schedule: List[Tuple[int, int, int]],
+) -> Optional[np.ndarray]:
+    """
+    將最終 replacement mask storage 轉成與 attn_masks/combined/overlay.png
+    同語意的灰階 overlay。
+    白(255) 代表越應該保留 source / 原圖，黑(0) 代表越應該保留 target gen。
+    """
+    if not storage_masks:
+        return None
+
+    collected: List[np.ndarray] = []
+    for si, mask_t in sorted(storage_masks.items()):
+        _, h, w = scale_schedule[si]
+        if mask_t.dtype == torch.bool:
+            display_mask = mask_t.squeeze().detach().cpu().numpy().astype(np.uint8) * 255
+        else:
+            display_mask = (
+                mask_t.squeeze().detach().cpu().float().clamp(0.0, 1.0).numpy() * 255.0
+            ).round().astype(np.uint8)
+        vis_size = max(256, h * 4, w * 4)
+        mask_vis = cv2.resize(display_mask, (vis_size, vis_size), interpolation=cv2.INTER_NEAREST)
+        collected.append(mask_vis)
+
+    if not collected:
+        return None
+
+    max_size = max(m.shape[0] for m in collected)
+    stacked = np.zeros((max_size, max_size), dtype=np.float32)
+    is_prob_mask = any(mask_t.dtype != torch.bool for mask_t in storage_masks.values())
+    for mask_vis in collected:
+        if mask_vis.shape[0] != max_size:
+            mask_vis = cv2.resize(mask_vis, (max_size, max_size), interpolation=cv2.INTER_NEAREST)
+        stacked += mask_vis.astype(np.float32)
+
+    if is_prob_mask:
+        overlay = np.clip(stacked / float(len(collected)), 0.0, 255.0).astype(np.uint8)
+    else:
+        if stacked.max() > 0:
+            stacked = stacked / stacked.max() * 255.0
+        overlay = stacked.astype(np.uint8)
+    return overlay
+
+
+def restore_background_from_overlay_mask(
+    edited_img: np.ndarray,
+    original_image_path: str,
+    overlay_mask_path: Optional[str],
+    overlay_mask_u8: Optional[np.ndarray],
+    white_threshold: float,
+) -> Tuple[np.ndarray, dict]:
+    """
+    將 overlay mask 中「非常白」的區域，用資料集原圖像素直接覆蓋回輸出圖。
+    """
+    thr = float(np.clip(white_threshold, 0.0, 1.0))
+    stats = {
+        "enabled": True,
+        "applied": False,
+        "overlay_mask_path": overlay_mask_path,
+        "overlay_mask_source": None,
+        "white_threshold": thr,
+        "white_threshold_u8": int(round(thr * 255.0)),
+        "restored_pixel_ratio": 0.0,
+    }
+
+    overlay_gray: Optional[np.ndarray] = None
+    if overlay_mask_path and os.path.exists(overlay_mask_path):
+        overlay_gray = cv2.imread(overlay_mask_path, cv2.IMREAD_GRAYSCALE)
+        stats["overlay_mask_source"] = "disk"
+    elif overlay_mask_u8 is not None:
+        overlay_gray = overlay_mask_u8
+        stats["overlay_mask_source"] = "memory"
+
+    if overlay_gray is None:
+        stats["reason"] = "missing_overlay_mask"
+        return edited_img, stats
+
+    original_img = cv2.imread(original_image_path, cv2.IMREAD_COLOR)
+    if original_img is None:
+        stats["reason"] = f"failed_to_read_original:{original_image_path}"
+        return edited_img, stats
+
+    out_h, out_w = edited_img.shape[:2]
+    if overlay_gray.shape != (out_h, out_w):
+        overlay_gray = cv2.resize(overlay_gray, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+    if original_img.shape[:2] != (out_h, out_w):
+        original_img = cv2.resize(original_img, (out_w, out_h), interpolation=cv2.INTER_LINEAR)
+
+    restore_mask = overlay_gray > stats["white_threshold_u8"]
+    restored_ratio = float(restore_mask.mean()) if restore_mask.size > 0 else 0.0
+    stats["restored_pixel_ratio"] = restored_ratio
+    stats["restored_pixel_percent"] = round(restored_ratio * 100.0, 4)
+
+    if not restore_mask.any():
+        stats["reason"] = "no_pixels_above_threshold"
+        return edited_img, stats
+
+    composited = edited_img.copy()
+    composited[restore_mask] = original_img[restore_mask]
+    stats["applied"] = True
+    return composited, stats
+
+
 def dilate_true_region(mask_bool: np.ndarray, expand_percent: float) -> np.ndarray:
     """
     對 bool mask 的 True 區域做膨脹（向外擴張）。
@@ -390,12 +519,26 @@ def expand_storage_masks_inplace(
         return
 
     for si, mask_t in list(masks.items()):
-        mask_np = mask_t.squeeze().cpu().numpy().astype(bool)  # [h, w]
-        expanded = dilate_true_region(mask_np, expand_percent)
-        masks[si] = (
-            torch.tensor(expanded, dtype=torch.bool)
-            .unsqueeze(0).unsqueeze(0).unsqueeze(-1).cpu()
-        )
+        if mask_t.dtype == torch.bool:
+            mask_np = mask_t.squeeze().cpu().numpy().astype(bool)  # [h, w]
+            expanded = dilate_true_region(mask_np, expand_percent)
+            masks[si] = (
+                torch.tensor(expanded, dtype=torch.bool)
+                .unsqueeze(0).unsqueeze(0).unsqueeze(-1).cpu()
+            )
+        else:
+            mask_np = mask_t.squeeze().cpu().numpy().astype(np.float32)  # [h, w]
+            h, w = mask_np.shape
+            radius = int(round(min(h, w) * (expand_percent / 100.0)))
+            if radius > 0:
+                k = radius * 2 + 1
+                kernel = np.ones((k, k), dtype=np.uint8)
+                mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+            mask_np = np.clip(mask_np, 0.0, 1.0)
+            masks[si] = (
+                torch.tensor(mask_np, dtype=torch.float32)
+                .unsqueeze(0).unsqueeze(0).unsqueeze(-1).cpu()
+            )
 
 
 def build_full_p2p_alignment(
@@ -475,8 +618,8 @@ def run_one_case(
     source_image_path: str,
     source_prompt: str,
     target_prompt: str,
-    source_focus_words: str,
-    target_focus_words: str,
+    source_focus_words: List[str],
+    target_focus_words: List[str],
     save_dir: str,
     args,
     scale_schedule: list,
@@ -486,12 +629,15 @@ def run_one_case(
     mask_path: Optional[str] = None,
     blended_words: Optional[List[str]] = None,
     case_source_dir: Optional[str] = None,
+    ref_mask_rle: Optional[List[int]] = None,
 ) -> bool:
     """
     執行一個 P2P-Edit 案例的完整 7 phase 管線。
     mask_path: PIE-Bench mask.png 路徑。不為 None 時啟用 PIE mask 模式：
       • 跳過 attention 閾值遮罩計算（Phase 1.5）
       • 以 PIE mask 等比例縮放作為各 scale 的 replacement mask
+    ref_mask_rle: PIE-Bench mapping_file.json 中的 mask RLE（(start,count) 對）。
+      若提供且 args.use_dynamic_threshold=1，則使用二分法搜尋閾值。
     成功回傳 True，失敗拋出例外。
     """
     pie_mode = int(args.use_pie_mask) if (mask_path is not None) else 0
@@ -499,6 +645,15 @@ def run_one_case(
     use_pie_ratio_threshold = (pie_mode == 2)
     os.makedirs(save_dir, exist_ok=True)
     ensure_case_reference_symlink(case_source_dir or '', save_dir)
+
+    # ── Reference mask for dynamic threshold (binary search) ──
+    use_dynamic_thr = bool(getattr(args, 'use_dynamic_threshold', 0))
+    dynamic_thr_iters = int(getattr(args, 'dynamic_threshold_iters', 20))
+    ref_mask_2d: Optional[np.ndarray] = None
+    if use_dynamic_thr and ref_mask_rle is not None and len(ref_mask_rle) >= 2:
+        ref_mask_2d = decode_rle_mask(ref_mask_rle, hw=(512, 512))
+        fg_ratio = ref_mask_2d.sum() / ref_mask_2d.size * 100
+        print(f"    [DynThresh] Reference mask decoded: {ref_mask_2d.sum()} fg pixels ({fg_ratio:.1f}%)")
 
     attn_cache_enabled = bool(args.use_attn_cache) and int(args.attn_cache_max_scale) > 0
     attn_cache_phase = args.attn_cache_phase if attn_cache_enabled else 'off'
@@ -527,12 +682,8 @@ def run_one_case(
             f"replace_pairs={len(cache_pairs)}, export_terms={len(source_terms_to_export)}"
         )
 
-    source_focus_words_list = (
-        [w for w in source_focus_words.split() if w] if source_focus_words.strip() else []
-    )
-    target_focus_words_list = (
-        [w for w in target_focus_words.split() if w] if target_focus_words.strip() else []
-    )
+    source_focus_words_list = source_focus_words
+    target_focus_words_list = target_focus_words
 
     # ── Focus Token Indices ──
     source_focus_token_indices = (
@@ -543,6 +694,15 @@ def run_one_case(
         find_focus_token_indices(text_tokenizer, target_prompt, target_focus_words_list)
         if target_focus_words_list else []
     )
+    has_source_focus = bool(source_focus_token_indices)
+    has_target_focus = bool(target_focus_token_indices)
+    single_focus_fallback = has_source_focus ^ has_target_focus
+    single_focus_side = "source" if has_source_focus else ("target" if has_target_focus else "none")
+    if single_focus_fallback:
+        print(
+            f"    ℹ Single-focus fallback: 僅使用 {single_focus_side} focus mask，"
+            "跳過 Phase 1.7"
+        )
 
     # ─────────────────────────────────────
     # Phase 0：編碼 Source Image
@@ -587,13 +747,13 @@ def run_one_case(
         pie_scale_masks, pie_mask_white_ratio = load_and_resize_pie_masks(
             mask_path, scale_schedule, args.num_full_replace_scales
         )
-        # 若 mask 幾乎全白（包含全白），視為不可用：回退到 source/target attention mask
-        if pie_mask_white_ratio >= 0.85:
+        # 若 mask 全白，視為不可用：回退到 source/target attention mask
+        if pie_mask_white_ratio >= (1.0 - 1e-6):
             pie_mask_forced_off = True
             use_pie_mask = False
             pie_scale_masks = {}
             print(
-                f"    ⚠ PIE mask 白色比例過高 ({pie_mask_white_ratio * 100:.2f}%)，"
+                f"    ⚠ PIE mask 幾乎全白 ({pie_mask_white_ratio * 100:.2f}%)，"
                 "改用 source/target attention mask"
             )
     elif use_pie_ratio_threshold:
@@ -607,6 +767,11 @@ def run_one_case(
             f"    ℹ PIE ratio→threshold: white={pie_mask_white_ratio * 100:.2f}% "
             f"-> attn_threshold_percentile={case_attn_threshold:.2f}"
         )
+
+    if single_focus_fallback and use_pie_mask:
+        use_pie_mask = False
+        pie_scale_masks = {}
+        print("    ℹ Single-focus fallback：忽略提供的 PIE mask，改用單邊 attention mask")
 
     # ─────────────────────────────────────
     # Phase 1：Source 生成 + Attention 擷取
@@ -667,6 +832,7 @@ def run_one_case(
             source_terms_to_export=source_terms_to_export,
             scale_schedule=scale_schedule,
             attn_block_indices=attn_block_indices,
+            use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
         )
         save_attention_cache_maps(
             export_maps=export_maps,
@@ -694,28 +860,75 @@ def run_one_case(
     # ─────────────────────────────────────
     source_text_masks: Dict[int, np.ndarray] = {}
     source_low_attn_masks: Dict[int, np.ndarray] = {}
+    use_last_scale = bool(getattr(args, 'use_last_scale_mask', 0))
     run_source_attn = need_source_attn and len(source_extractor.attention_maps) > 0
     if run_source_attn:
-        source_text_masks = collect_attention_text_masks(
-            extractor=source_extractor,
-            focus_token_indices=source_focus_token_indices,
-            scale_schedule=scale_schedule,
-            num_full_replace_scales=args.num_full_replace_scales,
-            attn_block_indices=attn_block_indices,
-            threshold_percentile=case_attn_threshold,
-            label="source",
-            low_attn=False,
-        )
-        source_low_attn_masks = collect_attention_text_masks(
-            extractor=source_extractor,
-            focus_token_indices=source_focus_token_indices,
-            scale_schedule=scale_schedule,
-            num_full_replace_scales=args.num_full_replace_scales,
-            attn_block_indices=attn_block_indices,
-            threshold_percentile=case_attn_threshold,
-            label="source_preserve",
-            low_attn=True,
-        )
+        if use_dynamic_thr and ref_mask_2d is not None:
+            # ── Dynamic threshold via binary search (Algorithm 1) ──
+            source_text_masks = collect_attention_text_masks_dynamic(
+                extractor=source_extractor,
+                focus_token_indices=source_focus_token_indices,
+                scale_schedule=scale_schedule,
+                num_full_replace_scales=args.num_full_replace_scales,
+                attn_block_indices=attn_block_indices,
+                ref_mask=ref_mask_2d,
+                max_iters=dynamic_thr_iters,
+                fallback_percentile=case_attn_threshold,
+                label="source",
+                low_attn=False,
+                use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+            )
+            source_low_attn_masks = collect_attention_text_masks_dynamic(
+                extractor=source_extractor,
+                focus_token_indices=source_focus_token_indices,
+                scale_schedule=scale_schedule,
+                num_full_replace_scales=args.num_full_replace_scales,
+                attn_block_indices=attn_block_indices,
+                ref_mask=ref_mask_2d,
+                max_iters=dynamic_thr_iters,
+                fallback_percentile=case_attn_threshold,
+                label="source_preserve",
+                low_attn=True,
+                use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+            )
+        else:
+            # ── Fixed percentile threshold (fallback) ──
+            _collect_fn = collect_last_scale_attention_mask if use_last_scale else collect_attention_text_masks
+            _collect_kwargs = dict(
+                extractor=source_extractor,
+                focus_token_indices=source_focus_token_indices,
+                scale_schedule=scale_schedule,
+                attn_block_indices=attn_block_indices,
+                threshold_percentile=case_attn_threshold,
+                label="source",
+                low_attn=False,
+                use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+            )
+            if use_last_scale:
+                _collect_kwargs["start_scale"] = args.num_full_replace_scales
+                _collect_kwargs["majority_threshold"] = float(getattr(args, 'last_scale_majority_threshold', 0.5))
+            else:
+                _collect_kwargs["num_full_replace_scales"] = args.num_full_replace_scales
+            source_text_masks = _collect_fn(**_collect_kwargs)
+
+            _collect_kwargs_low = dict(
+                extractor=source_extractor,
+                focus_token_indices=source_focus_token_indices,
+                scale_schedule=scale_schedule,
+                attn_block_indices=attn_block_indices,
+                threshold_percentile=case_attn_threshold,
+                label="source_preserve",
+                low_attn=True,
+                use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+            )
+            if use_last_scale:
+                _collect_kwargs_low["start_scale"] = args.num_full_replace_scales
+                _collect_kwargs_low["majority_threshold"] = float(getattr(args, 'last_scale_majority_threshold', 0.5))
+            else:
+                _collect_kwargs_low["num_full_replace_scales"] = args.num_full_replace_scales
+            source_low_attn_masks = _collect_fn(**_collect_kwargs_low)
 
     # ─────────────────────────────────────
     # Phase 1.6：建立 Phase 1.7 Preserve Storage
@@ -723,7 +936,7 @@ def run_one_case(
     # 一般模式：使用 source low-attention mask（同以前）
     # ─────────────────────────────────────
     phase17_storage: Optional[BitwiseTokenStorage] = None
-    if use_pie_mask and pie_scale_masks and image_scale_tokens:
+    if (not single_focus_fallback) and use_pie_mask and pie_scale_masks and image_scale_tokens:
         phase17_storage = BitwiseTokenStorage(num_scales=total_scales, device='cpu')
         for si, preserve_mask in pie_scale_masks.items():
             if si not in image_scale_tokens:
@@ -734,7 +947,7 @@ def run_one_case(
                 torch.tensor(preserve_mask, dtype=torch.bool)
                 .unsqueeze(0).unsqueeze(0).unsqueeze(-1).cpu()   # [1, 1, h, w, 1]
             )
-    elif source_low_attn_masks and image_scale_tokens:
+    elif (not single_focus_fallback) and source_low_attn_masks and image_scale_tokens:
         phase17_storage = BitwiseTokenStorage(num_scales=total_scales, device='cpu')
         for si, low_mask in source_low_attn_masks.items():
             if si not in image_scale_tokens:
@@ -753,8 +966,8 @@ def run_one_case(
     # ─────────────────────────────────────
     target_text_masks: Dict[int, np.ndarray] = {}
     # PIE mask 模式只要有 phase17_storage 就執行；一般模式需要 target_focus_token_indices
-    run_phase17 = (phase17_storage is not None) and (
-        use_pie_mask or bool(target_focus_token_indices)
+    run_phase17 = (not single_focus_fallback) and (phase17_storage is not None) and (
+        use_pie_mask or has_target_focus
     )
     if run_phase17:
         use_phase17_attn_cache_blended = (
@@ -767,7 +980,7 @@ def run_one_case(
         # PIE fallback 模式也需要 target attention；純淨 PIE 模式不需要
         need_target_attn = (
             not use_pie_mask or args.pie_mask_attn_fallback
-        ) and bool(target_focus_token_indices)
+        ) and has_target_focus
         target_extractor = CrossAttentionExtractor(
             model=infinity,
             block_indices=attn_block_indices,
@@ -795,7 +1008,7 @@ def run_one_case(
 
         with autocast(dtype=torch.bfloat16):
             with torch.no_grad():
-                _ = gen_one_img(
+                _phase17_img = gen_one_img(
                     infinity, vae, text_tokenizer, text_encoder,
                     target_prompt,
                     g_seed=args.seed,
@@ -814,6 +1027,13 @@ def run_one_case(
                     inject_image_features=None,
                     inject_schedule=None,
                 )
+        if getattr(args, 'debug_mode', 0):
+            _dbg_np = _phase17_img.cpu().numpy()
+            if _dbg_np.dtype != np.uint8:
+                _dbg_np = np.clip(_dbg_np, 0, 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(save_dir, 'phase17_guided.jpg'), _dbg_np)
+            del _dbg_np
+        del _phase17_img
 
         # 卸載順序：先卸 injector（後掛先卸），再卸 extractor
         if phase17_injector is not None:
@@ -821,15 +1041,131 @@ def run_one_case(
         if target_extractor is not None:
             target_extractor.remove_patches()
         if need_target_attn and target_extractor is not None:
-            target_text_masks = collect_attention_text_masks(
+            if use_dynamic_thr and ref_mask_2d is not None:
+                target_text_masks = collect_attention_text_masks_dynamic(
+                    extractor=target_extractor,
+                    focus_token_indices=target_focus_token_indices,
+                    scale_schedule=scale_schedule,
+                    num_full_replace_scales=args.num_full_replace_scales,
+                    attn_block_indices=attn_block_indices,
+                    ref_mask=ref_mask_2d,
+                    max_iters=dynamic_thr_iters,
+                    fallback_percentile=case_attn_threshold,
+                    label="target",
+                    low_attn=False,
+                    use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+                )
+            else:
+                _tgt_collect_fn = collect_last_scale_attention_mask if use_last_scale else collect_attention_text_masks
+                _tgt_kwargs = dict(
+                    extractor=target_extractor,
+                    focus_token_indices=target_focus_token_indices,
+                    scale_schedule=scale_schedule,
+                    attn_block_indices=attn_block_indices,
+                    threshold_percentile=case_attn_threshold,
+                    label="target",
+                    use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                    use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+                )
+                if use_last_scale:
+                    _tgt_kwargs["start_scale"] = args.num_full_replace_scales
+                    _tgt_kwargs["majority_threshold"] = float(getattr(args, 'last_scale_majority_threshold', 0.5))
+                else:
+                    _tgt_kwargs["num_full_replace_scales"] = args.num_full_replace_scales
+                target_text_masks = _tgt_collect_fn(**_tgt_kwargs)
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    # ─────────────────────────────────────
+    # Single-focus fallback（target-only）：
+    # 跳過 Phase 1.7 時，若只有 target focus，仍需獨立擷取 target mask
+    # ─────────────────────────────────────
+    if single_focus_fallback and (single_focus_side == 'target') and has_target_focus:
+        target_extractor = CrossAttentionExtractor(
+            model=infinity,
+            block_indices=attn_block_indices,
+            batch_idx=args.attn_batch_idx,
+            aggregate_method="mean",
+            capture_attention=True,
+        )
+        target_extractor.register_patches()
+        # Single-focus fallback：改用 source image 連續特徵注入前 N scale 作為結構錨定
+        _fallback_scales = getattr(args, 'phase17_fallback_replace_scales', 0)
+        # 建立 Phase 1.7 fallback 的 inject_schedule：
+        # 前 _fallback_scales 個 scale 100% 注入 source image 連續特徵（weight=0.0），
+        # 其餘 scale 自由生成（weight=1.0），讓 target 內容在細節 scale 自然顯現。
+        # NOTE: Phase 1 的結構錨定靠的是連續特徵注入（summed_codes），
+        #       而非離散 token 替換。必須傳入 inject_image_features 才能重現結構。
+        _fb_inject_schedule: Optional[List[float]] = None
+        _fb_inject_features = None
+        if _fallback_scales > 0 and image_raw_features is not None:
+            _fb_inject_schedule = (
+                [0.0] * min(_fallback_scales, total_scales)
+                + [1.0] * max(0, total_scales - _fallback_scales)
+            )
+            _fb_inject_features = image_raw_features
+            print(f"  ℹ Phase 1.7 single-focus fallback: source image 注入前 {_fallback_scales} 個 scale（連續特徵）")
+        with autocast(dtype=torch.bfloat16):
+            with torch.no_grad():
+                _fallback17_img = gen_one_img(
+                    infinity, vae, text_tokenizer, text_encoder,
+                    target_prompt,
+                    g_seed=args.seed,
+                    gt_leak=0, gt_ls_Bl=None,
+                    cfg_list=args.cfg, tau_list=args.tau,
+                    scale_schedule=scale_schedule,
+                    cfg_insertion_layer=[args.cfg_insertion_layer],
+                    vae_type=args.vae_type,
+                    sampling_per_bits=args.sampling_per_bits,
+                    enable_positive_prompt=args.enable_positive_prompt,
+                    p2p_token_storage=None,
+                    p2p_token_replace_prob=0.0,
+                    p2p_use_mask=False,
+                    p2p_save_tokens=False,
+                    p2p_attn_full_replace_scales=0,
+                    inject_image_features=_fb_inject_features,
+                    inject_schedule=_fb_inject_schedule,
+                )
+        if getattr(args, 'debug_mode', 0):
+            _dbg_np = _fallback17_img.cpu().numpy()
+            if _dbg_np.dtype != np.uint8:
+                _dbg_np = np.clip(_dbg_np, 0, 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(save_dir, 'phase17_fallback.jpg'), _dbg_np)
+            del _dbg_np
+        del _fallback17_img
+        target_extractor.remove_patches()
+        if use_dynamic_thr and ref_mask_2d is not None:
+            target_text_masks = collect_attention_text_masks_dynamic(
                 extractor=target_extractor,
                 focus_token_indices=target_focus_token_indices,
                 scale_schedule=scale_schedule,
                 num_full_replace_scales=args.num_full_replace_scales,
                 attn_block_indices=attn_block_indices,
+                ref_mask=ref_mask_2d,
+                max_iters=dynamic_thr_iters,
+                fallback_percentile=case_attn_threshold,
+                label="target",
+                low_attn=False,
+                use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
+            )
+        else:
+            _fb_collect_fn = collect_last_scale_attention_mask if use_last_scale else collect_attention_text_masks
+            _fb_kwargs = dict(
+                extractor=target_extractor,
+                focus_token_indices=target_focus_token_indices,
+                scale_schedule=scale_schedule,
+                attn_block_indices=attn_block_indices,
                 threshold_percentile=case_attn_threshold,
                 label="target",
+                use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                use_iqr_filter=bool(getattr(args, 'use_iqr_filter', 1)),
             )
+            if use_last_scale:
+                _fb_kwargs["start_scale"] = args.num_full_replace_scales
+                _fb_kwargs["majority_threshold"] = float(getattr(args, 'last_scale_majority_threshold', 0.5))
+            else:
+                _fb_kwargs["num_full_replace_scales"] = args.num_full_replace_scales
+            target_text_masks = _fb_collect_fn(**_fb_kwargs)
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
@@ -886,6 +1222,13 @@ def run_one_case(
     for si_tok, tok in image_scale_tokens.items():
         p2p_token_storage.tokens[si_tok] = tok
 
+    if args.use_cumulative_prob_mask and p2p_token_storage.masks:
+        p2p_token_storage.masks = build_cumulative_replacement_prob_masks(
+            masks=p2p_token_storage.masks,
+            scale_schedule=scale_schedule,
+            num_full_replace_scales=args.num_full_replace_scales,
+        )
+
     # 每個 scale 的 replacement mask（True=保留 source）向外擴張
     expand_storage_masks_inplace(
         p2p_token_storage.masks,
@@ -938,17 +1281,30 @@ def run_one_case(
                 invert=False,
             )
         if p2p_token_storage.masks:
-            combined_vis = {
-                si: ~m.squeeze().numpy()
-                for si, m in p2p_token_storage.masks.items()
-            }
-            _save_masks_to_dir(
-                bool_masks=combined_vis,
-                scale_schedule=scale_schedule,
-                vis_dir=os.path.join(attn_vis_dir, 'combined'),
-                file_prefix='combined_focus',
-                invert=True,
-            )
+            has_prob_mask = any(m.dtype != torch.bool for m in p2p_token_storage.masks.values())
+            if has_prob_mask:
+                combined_prob_vis = {
+                    si: _mask_tensor_to_prob_map(m)
+                    for si, m in p2p_token_storage.masks.items()
+                }
+                _save_prob_masks_to_dir(
+                    prob_masks=combined_prob_vis,
+                    scale_schedule=scale_schedule,
+                    vis_dir=os.path.join(attn_vis_dir, 'combined'),
+                    file_prefix='combined_replace_prob',
+                )
+            else:
+                combined_vis = {
+                    si: ~m.squeeze().numpy()
+                    for si, m in p2p_token_storage.masks.items()
+                }
+                _save_masks_to_dir(
+                    bool_masks=combined_vis,
+                    scale_schedule=scale_schedule,
+                    vis_dir=os.path.join(attn_vis_dir, 'combined'),
+                    file_prefix='combined_focus',
+                    invert=True,
+                )
 
     # ─────────────────────────────────────
     # Phase 2：Target 生成
@@ -1017,6 +1373,34 @@ def run_one_case(
     img_np = target_image.cpu().numpy()
     if img_np.dtype != np.uint8:
         img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+    if bool(getattr(args, 'restore_original_background_from_overlay', 1)):
+        overlay_mask_path = os.path.join(save_dir, 'attn_masks', 'combined', 'overlay.png')
+        overlay_mask_u8 = build_final_overlay_mask_from_storage(
+            p2p_token_storage.masks,
+            scale_schedule,
+        )
+        img_np, restore_stats = restore_background_from_overlay_mask(
+            edited_img=img_np,
+            original_image_path=source_image_path,
+            overlay_mask_path=overlay_mask_path,
+            overlay_mask_u8=overlay_mask_u8,
+            white_threshold=float(getattr(args, 'final_overlay_white_threshold', 0.92)),
+        )
+        with open(os.path.join(save_dir, 'background_restore.json'), 'w', encoding='utf-8') as f:
+            json.dump(restore_stats, f, ensure_ascii=False, indent=2)
+        if restore_stats.get('applied'):
+            print(
+                "    [FinalComposite] Restored original pixels from overlay white region: "
+                f"{restore_stats['restored_pixel_percent']:.3f}% "
+                f"(thr={restore_stats['white_threshold']:.3f}, "
+                f"src={restore_stats['overlay_mask_source']})"
+            )
+        else:
+            print(
+                "    [FinalComposite] Skip original-pixel restore: "
+                f"{restore_stats.get('reason', 'unknown')} "
+                f"(src={restore_stats.get('overlay_mask_source')})"
+            )
     cv2.imwrite(os.path.join(save_dir, 'target.jpg'), img_np)
 
     # 清理顯存
@@ -1038,17 +1422,33 @@ def main() -> None:
     )
     add_common_arguments(parser)
 
-    # ── 批量設定 ──
-    parser.add_argument('--bench_dir', type=str, required=True,
-                        help='extracted_pie_bench 根目錄')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='輸出根目錄（會依照原始資料夾結構存放結果）')
+    # ── 批量設定（bench_dir / output_dir 選填；未提供時走單一案例模式）──
+    parser.add_argument('--bench_dir', type=str, default=None,
+                        help='批量模式：extracted_pie_bench 根目錄')
+    parser.add_argument('--output_dir', type=str, default=None,
+                        help='批量模式：輸出根目錄（會依照原始資料夾結構存放結果）')
     parser.add_argument('--categories', type=str, default='',
                         help='只跑指定 category（逗號分隔資料夾名稱）；預設全部')
     parser.add_argument('--max_per_cat', type=int, default=-1,
                         help='每個 category 最多處理幾個案例（-1 = 全部）')
     parser.add_argument('--skip_existing', type=int, default=1, choices=[0, 1],
                         help='若 target.jpg 已存在則跳過（預設：1）')
+
+    # ── 單一案例模式（不使用 bench_dir 時）──
+    parser.add_argument('--source_image', type=str, default=None,
+                        help='單一模式：source 圖片路徑')
+    parser.add_argument('--source_prompt', type=str, default='',
+                        help='單一模式：source prompt')
+    parser.add_argument('--target_prompt', type=str, default='',
+                        help='單一模式：target prompt')
+    parser.add_argument('--source_focus_words', type=str, default='',
+                        help='單一模式：source focus 詞彙（空格分隔）')
+    parser.add_argument('--target_focus_words', type=str, default='',
+                        help='單一模式：target focus 詞彙（空格分隔）')
+    parser.add_argument('--save_file', type=str, default='./outputs/pie_edit_single',
+                        help='單一模式：輸出目錄')
+    parser.add_argument('--mask_path', type=str, default=None,
+                        help='單一模式：PIE mask.png 路徑（可選）')
 
     # ── P2P-Edit 參數 ──
     parser.add_argument('--num_full_replace_scales', type=int, default=2,
@@ -1094,10 +1494,29 @@ def main() -> None:
                              'blended = 僅 blended_words 指定的 token 做替換（現有行為）；'
                              'full_p2p = 完整 Prompt-to-Prompt 對齊'
                              '（所有共同 token + swap token 都注入 source attention）。')
+    parser.add_argument('--phase17_fallback_replace_scales', type=int, default=4,
+                        help='Single-focus fallback（只有 target focus）時，'
+                             'Phase 1.7 以 source gen token 替換前幾個 scale（0=停用）。預設：4')
+    parser.add_argument('--use_normalized_attn', type=int, default=0, choices=[0, 1],
+                        help='使用 z-score normalized threshold 取代固定 percentile（0=停用，1=啟用）')
+    parser.add_argument('--use_last_scale_mask', type=int, default=0, choices=[0, 1],
+                        help='僅從最後一個 scale 提取 attention mask，再向前逐步推導各 scale（0=停用，1=啟用）')
+    parser.add_argument('--last_scale_majority_threshold', type=float, default=0.5,
+                        help='Last-scale mask 向前推導時的多數投票閾值（預設 0.5 = 50%%）')
+    parser.add_argument('--restore_original_background_from_overlay', type=int, default=1, choices=[0, 1],
+                        help='target.jpg 存檔前，將最終 combined overlay 中灰階 > threshold 的區域，'
+                             '直接用 source_image 的原圖像素覆蓋回去。預設：1')
+    parser.add_argument('--final_overlay_white_threshold', type=float, default=0.92,
+                        help='最終 combined overlay 視為白區並回填原圖像素的門檻（0~1）。預設：0.92')
+    parser.add_argument('--debug_mode', type=int, default=0, choices=[0, 1],
+                        help='1=儲存所有中間過程圖片（phase17_guided.jpg、phase17_fallback.jpg）。預設：0')
 
     args = parser.parse_args()
-
-    # 解析 cfg（支援 "4" 和 "4,6" 兩種格式）
+    # 檢查模式：必須有 bench_dir 或 source_image
+    if args.bench_dir is None and not args.source_image:
+        parser.error('請提供 --bench_dir（批量模式）或 --source_image（单一模式）')
+    if args.bench_dir is not None and args.output_dir is None:
+        parser.error('批量模式需要指定 --output_dir')
     args.cfg = list(map(float, args.cfg.split(',')))
     if len(args.cfg) == 1:
         args.cfg = args.cfg[0]
@@ -1115,13 +1534,17 @@ def main() -> None:
     print(f'max_per_cat    : {args.max_per_cat if args.max_per_cat > 0 else "全部"}')
     print(f'full_replace   : {args.num_full_replace_scales} scales')
     print(f'attn_percentile: {args.attn_threshold_percentile}')
+    print(f'use_iqr_filter : {bool(args.use_iqr_filter)}')
     print(f'use_pie_mask   : {args.use_pie_mask} (0=off,1=direct,2=ratio->thr)')
     print(f'pie_attn_fallbk: {bool(args.pie_mask_attn_fallback)}')
     print(f'mask_expand_pct: {args.mask_expand_percent}')
+    print(f'cum_prob_mask : {bool(args.use_cumulative_prob_mask)}')
     print(f'use_attn_cache : {bool(args.use_attn_cache)}')
     print(f'attn_cache_ph  : {args.attn_cache_phase}')
     print(f'attn_cache_max : {args.attn_cache_max_scale}')
     print(f'attn_cache_mode: {args.attn_cache_align_mode}')
+    print(f'ph17_fb_scales : {args.phase17_fallback_replace_scales}')
+    print(f'debug_mode     : {bool(args.debug_mode)}')
     print('=' * 80 + '\n')
 
     # ── 載入模型（只載入一次）──
@@ -1151,6 +1574,62 @@ def main() -> None:
 
     device_cuda = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    # ══════════════════════════════════════════════════════
+    # 單一案例模式
+    # ══════════════════════════════════════════════════════
+    if args.bench_dir is None:
+        save_dir = os.path.abspath(args.save_file)
+        os.makedirs(save_dir, exist_ok=True)
+
+        src_focus_list = [w for w in args.source_focus_words.strip().split() if w]
+        tgt_focus_list = [w for w in args.target_focus_words.strip().split() if w]
+
+        # 若兩邊 focus 都未指定，自動從 prompt diff 推導
+        if not src_focus_list and not tgt_focus_list:
+            src_focus_list, tgt_focus_list = derive_focus_terms_from_prompt_diff(
+                args.source_prompt, args.target_prompt
+            )
+
+        pie_mask_path: Optional[str] = (
+            args.mask_path
+            if getattr(args, 'mask_path', None) and os.path.exists(args.mask_path)
+            else None
+        )
+
+        print(f'[單一模式]')
+        print(f'  source_image  : {args.source_image}')
+        print(f'  source_prompt : {args.source_prompt}')
+        print(f'  target_prompt : {args.target_prompt}')
+        print(f'  src_focus     : {src_focus_list}')
+        print(f'  tgt_focus     : {tgt_focus_list}')
+        print(f'  save_file     : {save_dir}')
+
+        run_one_case(
+            infinity=infinity,
+            vae=vae,
+            text_tokenizer=text_tokenizer,
+            text_encoder=text_encoder,
+            source_image_path=args.source_image,
+            source_prompt=args.source_prompt,
+            target_prompt=args.target_prompt,
+            source_focus_words=src_focus_list,
+            target_focus_words=tgt_focus_list,
+            save_dir=save_dir,
+            args=args,
+            scale_schedule=scale_schedule,
+            attn_block_indices=attn_block_indices,
+            total_scales=total_scales,
+            device_cuda=device_cuda,
+            mask_path=pie_mask_path,
+            blended_words=None,
+            case_source_dir=None,
+        )
+        print(f'\n✓ 完成！結果儲存於： {save_dir}')
+        return
+
+    # ══════════════════════════════════════════════════════
+    # 批量模式
+    # ══════════════════════════════════════════════════════
     # ── 決定要跑的 categories ──
     if args.categories.strip():
         cat_names = [c.strip() for c in args.categories.split(',') if c.strip()]
@@ -1224,7 +1703,11 @@ def main() -> None:
             raw_target    = meta.get('target_prompt', '')
             target_prompt = clean_target_prompt(raw_target)
             blended_words = meta.get('blended_words', [])
-            source_focus_words, target_focus_words = extract_focus_words(blended_words)
+            src_diff_terms, tgt_diff_terms = derive_focus_terms_from_prompt_diff(
+                source_prompt, target_prompt
+            )
+            source_focus_words = src_diff_terms
+            target_focus_words = tgt_diff_terms
 
             print(f'\n  [{idx+1}/{len(case_ids)}] {case_id}')
             print(f'    src : {source_prompt}')

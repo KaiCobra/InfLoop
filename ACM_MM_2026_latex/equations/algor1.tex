@@ -1,0 +1,28 @@
+\begin{algorithm}[t]
+\caption{Dynamic Mask Thresholding via Binary Search}
+\label{alg:dynamic_threshold}
+\small
+\begin{algorithmic}[1]
+\Require Filtered attention $\hat{a}_k$, reference mask $M_{\mathrm{ref}}$, tolerance $\epsilon$, max iterations $T$
+\Ensure Optimal threshold $\tau^*$
+
+\State $\hat{a}_k^{\uparrow} \gets \mathrm{Resize}(\hat{a}_k,\; H{\times}W)$
+\State $\tau_{\mathrm{lo}} \gets \min(\hat{a}_k^{\uparrow})$,\quad $\tau_{\mathrm{hi}} \gets \max(\hat{a}_k^{\uparrow})$
+
+\For{$t = 1$ \textbf{to} $T$}
+    \State $\tau_{\mathrm{mid}} \gets (\tau_{\mathrm{lo}} + \tau_{\mathrm{hi}})/2$
+    \State $M_{\mathrm{cand}} \gets \mathbb{1}[\hat{a}_k^{\uparrow} \ge \tau_{\mathrm{mid}}]$
+    \State $r_{\mathrm{in}} \gets \mathrm{mean}(M_{\mathrm{cand}}[M_{\mathrm{ref}}{=}1])$
+    \State $r_{\mathrm{out}} \gets \mathrm{mean}(M_{\mathrm{cand}}[M_{\mathrm{ref}}{=}0])$
+    \If{$r_{\mathrm{in}} > r_{\mathrm{out}}$}
+        \State $\tau_{\mathrm{lo}} \gets \tau_{\mathrm{mid}}$ \Comment{mask still concentrated inside}
+    \Else
+        \State $\tau_{\mathrm{hi}} \gets \tau_{\mathrm{mid}}$ \Comment{lost inside concentration}
+    \EndIf
+    \If{$\tau_{\mathrm{hi}} - \tau_{\mathrm{lo}} < \epsilon$}
+        \State \textbf{break}
+    \EndIf
+\EndFor
+\State \Return $(\tau_{\mathrm{lo}} + \tau_{\mathrm{hi}})/2$
+\end{algorithmic}
+\end{algorithm}

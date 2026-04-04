@@ -1,0 +1,19 @@
+\begin{table}[t]
+\caption{Ablation on attention-based masking (T2I mode, source and target prompts are from PIE-bench). \emph{Scale-$N$}: first $N$ scales replaced, no attention masks. \emph{Attn Mask}: our full three-phase attention-masked pipeline. S.D. stands for structure distance.}
+\label{tab:ablation_mask}
+\centering
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l|cccc|cc}
+\toprule
+Config & S.D.$\downarrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & CLIPw$\uparrow$ & CLIPe$\uparrow$ \\
+\midrule
+Scale-1 & 0.0843 & 12.25 & 0.433 & 0.393 & 0.2439 & 0.2210 \\
+Scale-2 & 0.0807 & 12.56 & 0.445 & 0.381 & 0.2427 & 0.2199 \\
+Scale-4 & 0.0611 & 14.08 & 0.496 & 0.319 & 0.2121 & 0.1946 \\
+Scale-6 & 0.0424 & 15.66 & 0.553 & 0.256 & 0.2001 & 0.1822 \\
+\midrule
+Attn Mask (Ours) & \textbf{0.0316} & \textbf{23.44} & \textbf{0.8565} & \textbf{0.0833} & \textbf{0.2613} & \textbf{0.2290} \\
+\bottomrule
+\end{tabular}}
+\end{table}

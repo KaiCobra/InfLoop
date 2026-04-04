@@ -108,6 +108,22 @@ def load_mask(path: str, target_hw: Tuple[int, int]) -> np.ndarray:
     return arr > 128  # True = edited region
 
 
+def decode_rle_mask(rle: List[int], hw: Tuple[int, int] = (512, 512)) -> np.ndarray:
+    """
+    解碼 PIE-Bench mapping_file.json 中的 mask RLE。
+    格式：(start, count) 交替排列，foreground=True。
+    回傳 bool 陣列 [H, W]，True = 編輯區域。
+    """
+    h, w = hw
+    flat = np.zeros(h * w, dtype=np.uint8)
+    for i in range(0, len(rle), 2):
+        start = rle[i]
+        count = rle[i + 1]
+        end = min(start + count, h * w)
+        flat[start:end] = 1
+    return flat.reshape(h, w).astype(bool)
+
+
 # ============================================================
 # 背景保留指標
 # ============================================================
@@ -335,6 +351,26 @@ class DINOStructureCalculator:
 # 主評估迴圈
 # ============================================================
 
+def _load_mapping_file(bench_dir: str) -> Dict:
+    """
+    載入 PIE-Bench_v1 的 mapping_file.json，
+    並建立 {category: {case_id: entry}} 的索引。
+    """
+    mapping_path = os.path.join(bench_dir, 'mapping_file.json')
+    if not os.path.isfile(mapping_path):
+        print(f'[Error] mapping_file.json 不存在：{mapping_path}')
+        sys.exit(1)
+    with open(mapping_path, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+
+    # 按 category 分組
+    grouped: Dict[str, Dict] = {}
+    for case_id, entry in raw.items():
+        cat = entry['image_path'].split('/')[0]  # e.g. "2_add_object_80"
+        grouped.setdefault(cat, {})[case_id] = entry
+    return grouped
+
+
 def evaluate_all(
     bench_dir: str,
     result_dir: str,
@@ -350,8 +386,13 @@ def evaluate_all(
     device: torch.device,
 ) -> None:
 
+    # ── 載入 mapping_file.json ──
+    print('\n[Init] 載入 mapping_file.json...')
+    cat_mapping = _load_mapping_file(bench_dir)
+    annotation_dir = os.path.join(bench_dir, 'annotation_images')
+
     # ── 初始化模型 ──
-    print('\n[Init] 載入 LPIPS 模型...')
+    print('[Init] 載入 LPIPS 模型...')
     lpips_calc = LPIPSCalculator(net=lpips_net, device=device)
 
     print('[Init] 載入 CLIP 模型...')
@@ -379,18 +420,16 @@ def evaluate_all(
     print(f'\n[Eval] 開始評估  bench={bench_dir}  result={result_dir}\n')
 
     for cat_name in categories:
-        cat_bench  = os.path.join(bench_dir, cat_name)
-        cat_result = os.path.join(result_dir, cat_name)
-
-        if not os.path.isdir(cat_bench):
-            print(f'[Warning] bench category 不存在，跳過：{cat_bench}')
+        if cat_name not in cat_mapping:
+            print(f'[Warning] bench category 不存在於 mapping_file.json，跳過：{cat_name}')
             continue
+        cat_result = os.path.join(result_dir, cat_name)
         if not os.path.isdir(cat_result):
             print(f'[Warning] result category 不存在，跳過：{cat_result}')
             continue
 
-        case_ids = sorted(d for d in os.listdir(cat_bench)
-                          if os.path.isdir(os.path.join(cat_bench, d)))
+        cat_entries = cat_mapping[cat_name]
+        case_ids = sorted(cat_entries.keys())
         if max_per_cat > 0:
             case_ids = case_ids[:max_per_cat]
 
@@ -401,18 +440,15 @@ def evaluate_all(
         cat_rows: List[Dict] = []
 
         for idx, case_id in enumerate(case_ids):
-            bench_case  = os.path.join(cat_bench, case_id)
+            entry       = cat_entries[case_id]
             result_case = os.path.join(cat_result, case_id)
 
             # ── 路徑檢查 ──
-            src_path    = os.path.join(bench_case, 'image.jpg')
-            mask_path   = os.path.join(bench_case, 'mask.png')
-            meta_path   = os.path.join(bench_case, 'meta.json')
+            src_path    = os.path.join(annotation_dir, entry['image_path'])
             target_path = os.path.join(result_case, 'target.jpg')
 
-            missing = [p for p in [src_path, mask_path, meta_path] if not os.path.exists(p)]
-            if missing:
-                print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ⚠ bench 檔案缺失：{missing}，跳過')
+            if not os.path.exists(src_path):
+                print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ⚠ source 影像缺失：{src_path}，跳過')
                 continue
             if not os.path.exists(target_path):
                 if skip_missing:
@@ -425,11 +461,9 @@ def evaluate_all(
                 print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ⚠ target.jpg 為空檔（寫入中斷），跳過')
                 continue
 
-            # ── 讀取 meta ──
-            with open(meta_path, 'r', encoding='utf-8') as f:
-                meta = json.load(f)
-            target_prompt = re.sub(r'\[([^\]]*)\]', r'\1', meta.get('target_prompt', '')).strip()
-            edit_action   = ','.join(meta.get('edit_action', {}).keys())
+            # ── 讀取 meta（from mapping_file.json entry）──
+            target_prompt = re.sub(r'\[([^\]]*)\]', r'\1', entry.get('editing_prompt', '')).strip()
+            edit_action   = entry.get('editing_instruction', '')
 
             # ── 讀取影像 ──
             try:
@@ -440,9 +474,9 @@ def evaluate_all(
                 print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ⚠ 影像讀取失敗（{e}），跳過')
                 continue
 
-            # ── 讀取遮罩（True=編輯，False=背景）──
-            edit_mask = load_mask(mask_path, ref_hw)    # [H, W] bool, True=edited
-            bg_mask   = ~edit_mask                      # True = background
+            # ── 解碼遮罩（True=編輯，False=背景）──
+            edit_mask = decode_rle_mask(entry['mask'], hw=ref_hw)  # [H, W] bool, True=edited
+            bg_mask   = ~edit_mask                                 # True = background
             bg_pct    = 100.0 * bg_mask.mean()
 
             # ── 背景保留指標 ──
@@ -672,10 +706,17 @@ def main() -> None:
     if args.categories.strip():
         categories = [c.strip() for c in args.categories.split(',') if c.strip()]
     else:
-        categories = sorted(
-            d for d in os.listdir(bench_dir)
-            if os.path.isdir(os.path.join(bench_dir, d))
-        )
+        # 從 mapping_file.json 自動列出所有 category
+        mapping_path = os.path.join(bench_dir, 'mapping_file.json')
+        if os.path.isfile(mapping_path):
+            with open(mapping_path, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            categories = sorted({v['image_path'].split('/')[0] for v in raw.values()})
+        else:
+            categories = sorted(
+                d for d in os.listdir(bench_dir)
+                if os.path.isdir(os.path.join(bench_dir, d))
+            )
 
     print(f'[Config] {len(categories)} 個 category，max_per_cat={args.max_per_cat}')
     print(f'[Config] LPIPS={args.lpips_net}  CLIP={args.clip_model}/{args.clip_pretrained}')

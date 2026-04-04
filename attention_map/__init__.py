@@ -12,6 +12,6 @@ Usage:
         --output outputs/attention_map_output
 """
 
-from .extractor import CrossAttentionExtractor
+from .extractor import CrossAttentionExtractor, SelfAttentionExtractor
 
-__all__ = ['CrossAttentionExtractor']
+__all__ = ['CrossAttentionExtractor', 'SelfAttentionExtractor']

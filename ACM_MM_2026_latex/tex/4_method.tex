@@ -1,0 +1,97 @@
+\input{equations/Eq_methods.tex}
+\section{Methodology}
+\label{section:method}
+
+\subsection{Preliminaries}
+\label{sec:preliminaries}
+
+\noindent\textbf{Visual Autoregressive Modeling.}
+Visual AutoRegressive modeling (VAR)~\cite{VAR} redefines image generation as a 
+coarse-to-fine process: rather than predicting tokens one by one in raster-scan 
+order, VAR first generates a rough low-resolution representation of the image and 
+progressively refines it at finer scales. Formally, VAR consists of a multi-scale tokenizer and 
+an autoregressive transformer. The tokenizer encodes an image $I$ into a hierarchy 
+of $K$ discrete token maps $\{R_1, R_2, \ldots, R_K\}$ at progressively finer 
+resolutions, where $R_k \in \mathbb{Z}^{h_k \times w_k}$ and 
+$h_1 < h_2 < \cdots < h_K$. The transformer then autoregressively predicts the 
+token map at each subsequent scale conditioned on all coarser scales and text 
+embeddings $\Psi(t)$:
+\begin{equation}
+    p(R_1, \ldots, R_K) = \prod_{k=1}^{K} p\!\left(R_k \mid R_1, \ldots, 
+    R_{k-1},\, \Psi(t)\right)
+\end{equation}
+All tokens within a scale are predicted in parallel, and each token in $R_k$ 
+corresponds to a spatially well-defined patch at resolution $(h_k, w_k)$. This 
+spatial locality is the structural property that makes token-level selective 
+editing geometrically meaningful in our framework.
+
+\noindent\textbf{Infinity and Bitwise Tokenization.}
+Infinity~\cite{Infinity} extends VAR by replacing the conventional index-wise 
+tokenizer with Binary Spherical Quantization (BSQ)~\cite{BSQVAE}, which projects 
+each continuous residual vector $z_k \in \mathbb{R}^d$ onto the unit hypersphere 
+and binarizes each dimension:
+\begin{equation}
+    q_k = \frac{1}{\sqrt{d}}\,\operatorname{sign}\!\left(\frac{z_k}{\|z_k\|}
+    \right)
+\end{equation}
+This formulation scales the vocabulary to effectively infinite size while keeping 
+computational cost linear in $d$. We adopt Infinity-2B as the backbone of our 
+framework. Critically for our method, BSQ encoding is \textit{lossless}: encoding 
+a real image into its bitwise token representation and decoding it back introduces 
+no reconstruction distortion beyond the tokenizer's inherent capacity, a property 
+we directly exploit when transplanting source image tokens into unedited regions 
+to guarantee pixel-faithful background preservation by construction.
+
+\subsection{Overview}
+
+Given a source image $I_s \in \mathbb{R}^{H \times W \times 3}$, a source prompt $P_s$, and a target prompt $P_t$, the goal of training-free image editing is to produce an edited image $I_e$ that reflects the semantic intent of $P_t$ while preserving all regions not specified by the instruction. Formally:
+\begin{equation}
+    I_e = f(I_s, P_s, P_t)
+\end{equation}
+where $f$ is realized entirely at inference time without any parameter updates.
+
+The overall architecture of our proposed method is illustrated in Figure~\ref{fig:pipeline}. The model first resolves spatial editing semantics via cross-modal attention analysis, then selectively rewrites only the targeted tokens. Concretely, our method performs a \textbf{dual-stream mask extraction} (Phases~1--2) followed by \textbf{mask-guided token composition} (Phase~3): \textbf{(1)~Source-Stream Mask Extraction} generates visual tokens conditioned on $P_s$ and extracts focus and preserve masks from cross-attention; \textbf{(2)~Target-Stream Mask Extraction} generates tokens conditioned on $P_t$ with background anchoring and extracts the target focus mask; and \textbf{(3)~Mask-Guided Token Composition} selectively replaces background tokens to produce the edited output. The edited token map at each scale is:
+\begin{equation}
+    r_k^e = M_k^{\mathrm{rep}} \odot r_k^s + (1 - M_k^{\mathrm{rep}}) \odot g_k
+\end{equation}
+where $g_k$ denotes tokens generated under the target prompt, $r_k^s$ the source tokens, and $\odot$ element-wise multiplication. The final edited image $I_e$ is decoded from $\{r_k^e\}_{k=1}^{K}$ by the BSQ-VAE decoder.
+
+\subsection{Attention Mask Construction}
+\label{sec:mask_construction}
+\input{imgs/globalEffect}
+
+\noindent\textbf{IQR-Filtered Attention Extraction.}
+Directly using raw cross-attention maps yields noisy and unreliable masks, because certain transformer blocks produce attention dominated by positional bias rather than semantic content — a \textit{global layer effect} that spreads attention uniformly regardless of the text query (see Fig.~\ref{fig:globalEffect}).
+
+We suppress these outlier transformer blocks using Interquartile Range (IQR) filtering, a non-parametric method requiring no learned parameters. Let $A_{k,b} \in \mathbb{R}^{N_v \times N_t}$ denote the cross-attention matrix at scale $k$ and transformer block $b$, where $N_v$ is the number of visual tokens and $N_t$ the number of text tokens. Let $\mathcal{F} \subset \{1, \ldots, N_t\}$ denote the set of token indices corresponding to the editing-relevant words in the prompt (e.g., ``water bottle''). For each transformer block $b$, we extract the columns of $A_{k,b}$ indexed by $\mathcal{F}$ and average them to obtain a spatial attention map $a_{k,b} \in \mathbb{R}^{N_v}$, which indicates how strongly each visual token attends to the focus words. We then compute the mean attention map across all blocks, $\bar{a}_k = \frac{1}{B}\sum_{b} a_{k,b}$, and measure each block's deviation as $e_b = \mathrm{MSE}(a_{k,b},\, \bar{a}_k)$. Blocks whose deviation exceeds the IQR fence are discarded:
+\EqIqrFilter
+where $Q_1$ and $Q_3$ are the first and third quartiles of $\{e_b\}$. The retained set $\mathcal{B}_{\mathrm{keep}}$ contains only transformer blocks whose attention maps reflect semantic content rather than positional bias. The filtered attention map is then computed as the mean over the attention maps of these retained blocks:
+\EqFilteredAttn
+In practice, approximately 10--20\% of blocks are filtered per scale, yielding substantially more spatially coherent attention maps.
+
+\noindent\textbf{Mask Binarization.}
+The filtered map $\hat{a}_k$ is binarized into two complementary masks using a single percentile parameter $p$ (default $p{=}0.8$). Let $\tau_k$ be the $p$-th percentile of $\hat{a}_k$ and $\tau_k^{\mathrm{low}}$ the $(1{-}p)$-th percentile; both thresholds are inherently scale-adaptive. When an external reference mask is available, we apply a binary search procedure to find the optimal $\tau_k$ automatically (see Algorithm~1 in the supplementary material). The resulting masks are:
+\EqMasks
+The focus mask $M_k^{\mathrm{f}}$ marks high-attention regions corresponding to editing-relevant words, which should \textit{not} be overwritten by source tokens. The preserve mask $M_{k,s}^{\mathrm{p}}$ marks pure background positions used to anchor source content and prevent structural drift.
+
+
+\subsection{Three-Phase Editing Pipeline}
+\label{sec:pipeline}
+
+At each generation scale, the editing pipeline executes three phases in sequence. Phase~1 injects source tokens and extracts source-side masks from cross-attention (see Fig.~\ref{fig:pipeline}), Phase~2 extracts target-side masks with background anchoring, and Phase~3 composes the final tokens by merging the two streams. For the first $N$ coarse scales (empirically $N{=}2$), all tokens are directly replaced with source tokens $r_k^s$ to preserve global layout, since coarse scales encode low-frequency structure that should remain unchanged. For scales $k \geq N$, the following three phases apply.
+
+\noindent\textbf{Phase~1: Source-Stream Mask Extraction.}
+
+To identify which spatial regions correspond to the source semantics, we generate visual tokens at scale $k$ conditioned on the source prompt $P_s$. From the resulting cross-attention, we apply IQR filtering and thresholding (Sec.~\ref{sec:mask_construction}) to obtain the source focus mask $M_{k,s}^{\mathrm{f}}$ and the preserve mask $M_{k,s}^{\mathrm{p}}$.
+
+\noindent\textbf{Phase~2: Target-Stream Mask Extraction.}
+
+Central to our \textit{understanding-before-editing} philosophy, the model must understand which regions the edit will affect before committing to any token replacement. Since the source-side mask alone cannot capture regions newly introduced by the target prompt, we perform a second generation pass conditioned on the target prompt $P_t$, anchoring positions where $M_{k,s}^{\mathrm{p}} = 1$ to source tokens $r_k^s$ to prevent background drift. From the resulting cross-attention, we extract the target focus mask $M_{k,t}^{\mathrm{f}}$ via the same filtering and thresholding procedure.
+
+\noindent\textbf{Phase~3: Mask-Guided Token Composition.}
+
+Given the dual-stream masks, we compute the replacement mask $M_k^{\mathrm{rep}} = \neg(M_{k,s}^{\mathrm{f}} \cup M_{k,t}^{\mathrm{f}})$, which marks background positions for source token substitution. We generate the target tokens $g_k$ freely under $P_t$, then assemble the final output:
+\EqTokenReplace
+The complete procedure is summarized in Algorithm~2 in the supplementary material.
+
+Beyond real image editing, our framework naturally extends to a text-to-image (T2I) editing mode by setting $I_s = \varnothing$, i.e., $I_e = f(P_s, P_t)$, where both source and target images are generated from prompts without any real image input. This scenario targets modifying generated content rather than editing an existing photograph, and our method produces high-quality results under this setting as well. We present T2I editing results and use this mode to validate the attention mask mechanism in the supplementary material.

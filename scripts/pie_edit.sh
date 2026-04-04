@@ -17,7 +17,7 @@
 #   --skip_existing  1 = 跳過已完成案例（續跑斷點），0 = 全部重跑
 #   --save_attn_vis  1 = 儲存 attention 遮罩視覺化（較慢），預設 0
 # ==============================================================================
-
+echo "This one is abortion, please run batch_run_pie_edit.sh instead"
 # ── 模型設定（與 infer_p2p_edit.sh 相同）──
 pn=1M
 model_type=infinity_2b
@@ -51,7 +51,7 @@ p2p_token_replace_prob=0.0
 
 # ── 批量設定 ──
 bench_dir="./outputs/outputs_loop_exp/extracted_pie_bench"
-output_dir="./outputs/outputs_loop_exp/pie_bench_results_pieAttnCacheBoth10"
+output_dir="./outputs/outputs_loop_exp/pie_bench_results_pieMaskRatioProbReplace"
 
 # 只跑特定 category（逗號分隔資料夾名稱），留空白代表全部
 # 範例：categories="0_random_140,1_change_object_80"
@@ -65,12 +65,13 @@ skip_existing=1
 
 # 是否儲存 attention 遮罩視覺化（1 = 開啟，批量評估時建議關閉）
 save_attn_vis=1
+use_normalized_attn=0
 
 # 是否使用 PIE-Bench 提供的 mask.png 做為 token 替換遮罩
 # 0 = 使用 attention threshold（預設）
 # 1 = 使用 PIE mask 直接作為 replacement mask
 # 2 = 使用 PIE mask 白色比例反推 attn_threshold_percentile（65~92 反向線性）
-use_pie_mask=2
+use_pie_mask=0
 
 # （需 use_pie_mask=1）白色（編輯）區域內以 attention 二次篩選
 # 0 = 純 PIE mask（預設）；1 = PIE mask AND attention fallback
@@ -80,7 +81,17 @@ pie_mask_attn_fallback=0
 
 # 每個 scale 的最終 replacement mask 向外擴張比例（% of min(H,W)）
 # 0 = 不擴張，建議先試 1~3
-mask_expand_percent=3
+mask_expand_percent=0
+
+# 是否啟用跨尺度累積機率遮罩
+# 1 = 當前 scale 使用前面所有 scale mask 疊加平均（灰階=替換機率）
+# 0 = 維持單一 scale 對單一 mask（bool）
+use_cumulative_prob_mask=0
+
+# Single-focus fallback（只有 target focus，無 source focus）時，
+# Phase 1.7 以 source gen token 替換前幾個 scale，讓 attention 擷取時有結構參考
+# 0 = 停用（純 free-gen）；建議值 4
+phase17_fallback_replace_scales=4
 
 # ── Prompt-to-Prompt 風格 Attention Cache ──
 # 0 = 關閉；1 = 開啟
@@ -136,6 +147,7 @@ python3 tools/run_pie_edit.py \
   --attn_batch_idx ${attn_batch_idx} \
   --p2p_token_replace_prob ${p2p_token_replace_prob} \
   --save_attn_vis ${save_attn_vis} \
+  --use_normalized_attn ${use_normalized_attn} \
   --bench_dir "${bench_dir}" \
   --output_dir "${output_dir}" \
   ${categories:+--categories "${categories}"} \
@@ -144,6 +156,8 @@ python3 tools/run_pie_edit.py \
   --use_pie_mask ${use_pie_mask} \
   --pie_mask_attn_fallback ${pie_mask_attn_fallback} \
   --mask_expand_percent ${mask_expand_percent} \
+  --use_cumulative_prob_mask ${use_cumulative_prob_mask} \
+  --phase17_fallback_replace_scales ${phase17_fallback_replace_scales} \
   --use_attn_cache ${use_attn_cache} \
   --attn_cache_phase ${attn_cache_phase} \
   --attn_cache_max_scale ${attn_cache_max_scale} \

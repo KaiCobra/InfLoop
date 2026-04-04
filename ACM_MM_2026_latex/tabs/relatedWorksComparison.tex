@@ -1,0 +1,135 @@
+\begin{table*}[t]
+\centering
+\caption{Comparison of different editing methods. Darker color indicates better performance.}
+\label{tab:method_comparison_wo_kvedit}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l l c c c c c c c c c}
+\toprule
+Method & Base Model & Param. & S.D.$\downarrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & CLIP whole$\uparrow$ & CLIP edited$\uparrow$ & Resolution & Inf. Time$\downarrow$\\
+\midrule
+Prompt-to-Prompt \cite{prompt2prompt} & Diffusion & 2B
+& \AutoCellDown{0.0694}{0.0222}{0.0694}{0}
+& \AutoCellUp{17.87}{17.87}{25.33}{0}
+& \AutoCellUp{0.7114}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.2088}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2501}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2244}{0.2054}{0.2337}{0}
+& 0.5k
+& 13.6 \\
+
+Pix2Pix-Zero \cite{pix2pix-zero} & Diffusion & \textasciitilde1B
+& \AutoCellDown{0.0617}{0.0222}{0.0694}{0}
+& \AutoCellUp{20.44}{17.87}{25.33}{0}
+& \AutoCellUp{0.7467}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1722}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2280}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2054}{0.2054}{0.2337}{0}
+& 0.5k
+& 17.0 \\
+
+MasaCtrl \cite{masactrl} & Diffusion & \textasciitilde1B
+& \AutoCellDown{0.0284}{0.0222}{0.0694}{0}
+& \AutoCellUp{22.17}{17.87}{25.33}{0}
+& \AutoCellUp{0.7967}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1066}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2396}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2116}{0.2054}{0.2337}{0}
+& 0.5k
+& 12.6 \\
+
+PnP \cite{PnP} & Diffusion & \textasciitilde1B
+& \AutoCellDown{0.0282}{0.0222}{0.0694}{0}
+& \AutoCellUp{22.28}{17.87}{25.33}{0}
+& \AutoCellUp{0.7905}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1134}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2541}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2255}{0.2054}{0.2337}{0}
+& 0.5k
+& 8.0 \\
+
+PnP Inversion \cite{PnP_Inversion} & Diffusion & \textasciitilde1B
+& \AutoCellDown{0.0243}{0.0222}{0.0694}{1}
+& \AutoCellUp{22.46}{17.87}{25.33}{0}
+& \AutoCellUp{0.7968}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1061}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2541}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2262}{0.2054}{0.2337}{0}
+& 0.5k
+& 8.0 \\
+
+LEDits++ \cite{LEDits++} & Diffusion & \textasciitilde1B
+& \AutoCellDown{0.0431}{0.0222}{0.0694}{0}
+& \AutoCellUp{19.64}{17.87}{25.33}{0}
+& \AutoCellUp{0.7767}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1334}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2642}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2337}{0.2054}{0.2337}{0}
+& 0.5k
+& 2.8 \\
+\midrule
+FlowEdit \cite{Flowedit} & Flow & 12B
+& \AutoCellDown{0.0283}{0.0222}{0.0694}{0}
+& \AutoCellUp{21.86}{17.87}{25.33}{0}
+& \AutoCellUp{0.8368}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1100}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2605}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2281}{0.2054}{0.2337}{0}
+& 0.5k
+& 6.5 \\
+
+RF-Inversion \cite{RF-inversion} & Flow & 12B
+& \AutoCellDown{0.0406}{0.0222}{0.0694}{0}
+& \AutoCellUp{20.82}{17.87}{25.33}{0}
+& \AutoCellUp{0.7192}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1900}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2520}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2211}{0.2054}{0.2337}{0}
+& 1k
+& 24.8 \\
+
+ReFlex \cite{ReFlex} & Flow & 12B
+& \AutoCellDown{0.0312}{0.0222}{0.0694}{0}
+& \AutoCellUp{25.33}{17.87}{25.33}{0}
+& \AutoCellUp{0.8436}{0.7114}{0.8565}{1}
+& \AutoCellDown{0.0961}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2602}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2266}{0.2054}{0.2337}{0}
+& 1k
+& 12.4 \\
+
+FireFlow \cite{FireFlow} & Flow & 12B
+& \AutoCellDown{0.0222}{0.0222}{0.0694}{0}
+& \AutoCellUp{23.80}{17.87}{25.33}{0}
+& \AutoCellUp{0.8211}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.1168}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2348}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2084}{0.2054}{0.2337}{0}
+& 0.5k
+& 2.5 \\
+\midrule
+AREdit$^\dag$ \cite{AREdit} & VAR & 2B
+& \AutoCellDown{0.0305}{0.0222}{0.0694}{0}
+& \AutoCellUp{24.19}{17.87}{25.33}{1}
+& \AutoCellUp{0.8370}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.0870}{0.0833}{0.2088}{1}
+& \AutoCellUp{0.2542}{0.2280}{0.2642}{0}
+& \AutoCellUp{0.2277}{0.2054}{0.2337}{0}
+& 1k
+& 2.5 \\
+\rowcolor{gray!10}
+Ours & VAR & 2B
+& \AutoCellDown{0.0316}{0.0222}{0.0694}{0}
+& \AutoCellUp{23.44}{17.87}{25.33}{0}
+& \AutoCellUp{0.8565}{0.7114}{0.8565}{0}
+& \AutoCellDown{0.0833}{0.0833}{0.2088}{0}
+& \AutoCellUp{0.2613}{0.2280}{0.2642}{1}
+& \AutoCellUp{0.2290}{0.2054}{0.2337}{1}
+& 1k
+& 2.5 \\
+\bottomrule
+\end{tabular}%
+}
+\vspace{1pt}
+\raggedright{\footnotesize $^\dag$Results cited from the original paper; no official implementation has been released.}
+\end{table*}
+

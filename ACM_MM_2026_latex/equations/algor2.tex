@@ -1,0 +1,45 @@
+\begin{algorithm}[t]
+\caption{Three-Phase Attention-Masked Editing}
+\label{alg:editing}
+\small
+\begin{algorithmic}[1]
+\Require Source image $I_{\mathrm{src}}$, prompts $P_s, P_t$, focus word sets $\mathcal{F}_s, \mathcal{F}_t$,
+         structural scales $N$, total scales $S$, optional reference mask $M_{\mathrm{ref}}$
+\Ensure Edited image $I_{\mathrm{edit}}$
+
+\State $\{r_k^s\}_{k=1}^{S} \gets \mathcal{Q}_{\mathrm{BSQ}}\!\bigl(\mathcal{E}(I_{\mathrm{src}})\bigr)$
+
+\For{$k = 1$ \textbf{to} $S$}
+
+    \Statex \textit{\quad Phase 1: Source Generation and Mask Extraction}
+    \State Generate tokens at scale $k$ conditioned on $P_s$
+    \If{$k \ge N$}
+        \State Compute $a_{k,b}$ for focus words $\mathcal{F}_s$; filter via IQR $\to \hat{a}_k^{(s)}$
+        \State $\tau_k^{(s)} \gets \mathrm{Threshold}(\hat{a}_k^{(s)},\, M_{\mathrm{ref}})$ \Comment{binary search or percentile}
+        \State $M_{k,s}^{\mathrm{f}} \gets \mathbb{1}[\hat{a}_k^{(s)} \ge \tau_k^{(s)}]$,\quad
+               $M_{k,s}^{\mathrm{p}} \gets \mathbb{1}[\hat{a}_k^{(s)} \le \tau_k^{\mathrm{low}}]$
+    \EndIf
+
+    \Statex \textit{\quad Phase 2: Target Focus Mask}
+    \State Generate tokens at scale $k$ conditioned on $P_t$
+    \If{$k \ge N$}
+        \State Anchor positions where $M_{k,s}^{\mathrm{p}}{=}1$ to $r_k^s$
+        \State Compute $a_{k,b}$ for focus words $\mathcal{F}_t$; filter via IQR $\to \hat{a}_k^{(t)}$
+        \State $\tau_k^{(t)} \gets \mathrm{Threshold}(\hat{a}_k^{(t)},\, M_{\mathrm{ref}})$
+        \State $M_{k,t}^{\mathrm{f}} \gets \mathbb{1}[\hat{a}_k^{(t)} \ge \tau_k^{(t)}]$
+    \EndIf
+
+    \Statex \textit{\quad Phase 3: Target Generation with Token Replacement}
+    \State $M_k^{\mathrm{rep}} \gets \neg\!\bigl(M_{k,s}^{\mathrm{f}} \cup M_{k,t}^{\mathrm{f}}\bigr)$
+    \State Generate $g_k$ at scale $k$ conditioned on $P_t$
+    \If{$k < N$}
+        \State $r_k \gets r_k^s$ \Comment{full structural anchoring}
+    \Else
+        \State $r_k \gets M_k^{\mathrm{rep}} \odot r_k^s + (1{-}M_k^{\mathrm{rep}}) \odot g_k$
+    \EndIf
+
+\EndFor
+
+\State \Return $\mathcal{D}_{\mathrm{VAE}}\!\bigl(\textstyle\sum_{k} \mathrm{up}(\mathrm{dec}(r_k))\bigr)$
+\end{algorithmic}
+\end{algorithm}
