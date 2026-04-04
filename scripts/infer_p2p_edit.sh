@@ -34,7 +34,7 @@ use_bit_label=1
 checkpoint_type='torch'
 infinity_model_path=weights/infinity_2b_reg.pth
 vae_type=32
-vae_path=weights/infinity_vae_d32reg.pth
+vae_path=weights/infinity_vae_d32_reg.pth
 cfg=4
 tau=0.5
 rope2d_normalized_by_hw=2
@@ -50,8 +50,7 @@ apply_spatial_patchify=0
 # Source image 路徑（將被 VAE 編碼為離散 token）
 # • 設定路徑 → P2P-Edit 模式：source gen 注入 + P2P token 來自 source image 編碼
 # • 留空白   → 純 P2P-Attn 模式：P2P token 來自 source gen 採樣（與 run_p2p_attn.py 相同）
-source_image="./outputs/outputs_loop_exp/extracted_pie_bench/2_add_object_80/211000000000/image.jpg"
-source_image="./image.png"
+source_image="./input/mona_lisa.jpg"
 # source_image=""  # 用此行可切換為純 P2P-Attn 模式
 
 # 前幾個 scale 使用 source image 注入（weight=0 → 100% source image）
@@ -79,7 +78,7 @@ num_full_replace_scales=2
 # Attention 閾值百分位數
 # 高於此百分位的空間位置被視為「focus 區域」（不替換）
 # 75 = 前 25% 最強 attention 視為 focus 區域
-attn_threshold_percentile=80
+attn_threshold_percentile=98
 
 # 用於計算 attention 遮罩的 transformer block 起始/結束 index
 # -1 = 自動（起始 = 模型深度的 1/2，結束 = 最後一個 block）
@@ -122,10 +121,10 @@ target_prompt="A oil paint of a Green Frog in a blue suit speaking at a micropho
 source_focus_words="photo confident politician"
 target_focus_words="oil paint Green Frog"
 
-source_prompt="A photo of Pimples"
-target_prompt="A photo of "
-source_focus_words="A photo of "
-target_focus_words=""
+source_prompt="A painting of Mona Lisa with a calm smile face"
+target_prompt="A painting of Mona Lisa laughing out loud with mouth wide open face"
+source_focus_words="calm smile face"
+target_focus_words="laughing out loud with mouth wide open face"
 
 # ── 其他範例 ──
 

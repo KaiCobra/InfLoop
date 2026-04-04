@@ -348,6 +348,7 @@ def evaluate_all(
     clip_pretrained: str,
     no_structure_dist: bool,
     device: torch.device,
+    source_from_result: bool = False,
 ) -> None:
 
     # ── 初始化模型 ──
@@ -405,7 +406,10 @@ def evaluate_all(
             result_case = os.path.join(cat_result, case_id)
 
             # ── 路徑檢查 ──
-            src_path    = os.path.join(bench_case, 'image.jpg')
+            if source_from_result:
+                src_path = os.path.join(result_case, 'source.jpg')
+            else:
+                src_path = os.path.join(bench_case, 'image.jpg')
             mask_path   = os.path.join(bench_case, 'mask.png')
             meta_path   = os.path.join(bench_case, 'meta.json')
             target_path = os.path.join(result_case, 'target.jpg')
@@ -659,6 +663,9 @@ def main() -> None:
                         help='跳過 Structure Distance 計算（較慢，需要 DINO）')
     parser.add_argument('--device', type=str, default='',
                         help='cuda / cpu（預設：自動偵測）')
+    parser.add_argument('--source_from_result', type=int, default=0, choices=[0, 1],
+                        help='若為 1，從 result_dir 讀取 source.jpg 作為 source image'
+                             '（用於 prompt-based 生成的實驗）。預設：0（從 bench_dir 讀取 image.jpg）')
 
     args = parser.parse_args()
 
@@ -697,6 +704,7 @@ def main() -> None:
         clip_pretrained   = args.clip_pretrained,
         no_structure_dist = args.no_structure_dist,
         device            = device,
+        source_from_result = bool(args.source_from_result),
     )
 
 
