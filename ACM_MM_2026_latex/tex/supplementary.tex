@@ -1,0 +1,33 @@
+% \section{Algorithm Details}
+% \label{sec:supp_algorithms}
+
+% \subsection{Adaptive Mask Thresholding}
+% \label{sec:supp_adaptive_threshold}
+
+% Rather than using a fixed percentile for mask binarization, we adaptively adjust the percentile parameter $p$ based on the spatial distribution of attention scores in each image. The intuition is straightforward: when many spatial positions exhibit high attention (i.e., the editing region is large), a higher percentile is needed to produce a selective mask; when attention is concentrated on few positions, a lower percentile avoids over-masking.
+
+% Concretely, we first compute the hot-spot ratio $\rho$, defined as the fraction of spatial positions in $\hat{a}_k$ that exceed a base threshold $\tau_{\mathrm{base}}$:
+% \begin{equation}
+%     \rho = \frac{|\{i : \hat{a}_k[i] > \tau_{\mathrm{base}}\}|}{N_v}
+% \end{equation}
+% The percentile parameter $p$ is then obtained via linear mapping over a predefined range $[p_{\min}, p_{\max}]$:
+% \begin{equation}
+%     p = p_{\min} + \rho \cdot (p_{\max} - p_{\min})
+% \end{equation}
+% In our experiments, we set $\tau_{\mathrm{base}}$ to the median of $\hat{a}_k$, $p_{\min} = 0.7$, and $p_{\max} = 0.9$. The final threshold is $\tau_k = \mathrm{Percentile}(\hat{a}_k, p)$. The procedure is given in Algorithm~\ref{alg:adaptive_threshold} below.
+
+% \input{equations/algor1}
+
+% \subsection{Complete Editing Pipeline}
+% \label{sec:supp_pipeline}
+
+% Algorithm~\ref{alg:editing} gives the full three-phase procedure corresponding to Section~4.3 in the main text.
+
+% \input{equations/algor2}
+
+% \subsection{Scale-Level Replacement Analysis}
+% \label{sec:supp_shape_diff}
+
+% \input{imgs/shape_diff}
+
+% Fig.~\ref{fig:shape_diff_a} shows the effect of varying the number of shared scales $N$: few shared scales allow editing but degrade the background, while many shared scales preserve the background but lock the global layout. Fig.~\ref{fig:shape_diff_b} further illustrates VAR's coarse-to-fine generation, where early scales commit to the global structure, limiting the effectiveness of fixed-scale replacement strategies. Our attention-mask approach resolves this tension by selectively replacing only background tokens at every scale.

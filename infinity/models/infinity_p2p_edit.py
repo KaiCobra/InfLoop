@@ -825,14 +825,35 @@ class Infinity(nn.Module):
                         elif p2p_use_mask and p2p_token_storage.has_mask_for_scale(si):
                             spatial_mask = p2p_token_storage.load_mask(si, idx_Bld.device)
                             if spatial_mask is not None:
-                                idx_Bld = torch.where(spatial_mask, source_indices_loaded, idx_Bld)
-                                num_replaced = spatial_mask.sum().item()
-                                total_tokens = spatial_mask.numel()
+                                if spatial_mask.shape[2] != h_cur or spatial_mask.shape[3] != w_cur:
+                                    sm = spatial_mask.squeeze(1).permute(0, 3, 1, 2).float()  # [B,1,h,w]
+                                    sm = F.interpolate(sm, size=(h_cur, w_cur), mode='nearest')
+                                    spatial_mask = sm.permute(0, 2, 3, 1).unsqueeze(1)  # [B,1,h,w,1]
+
+                                if spatial_mask.shape[0] == 1 and B > 1:
+                                    spatial_mask = spatial_mask.expand(B, -1, -1, -1, -1)
+
+                                if spatial_mask.dtype == torch.bool:
+                                    replace_mask = spatial_mask
+                                    prob_mean = float(replace_mask.float().mean().item())
+                                else:
+                                    replace_prob = spatial_mask.float().clamp(0.0, 1.0)
+                                    rand_mask = torch.rand(
+                                        B, 1, h_cur, w_cur, 1,
+                                        device=idx_Bld.device,
+                                        dtype=replace_prob.dtype,
+                                    )
+                                    replace_mask = rand_mask < replace_prob
+                                    prob_mean = float(replace_prob.mean().item())
+
+                                idx_Bld = torch.where(replace_mask, source_indices_loaded, idx_Bld)
+                                num_replaced = replace_mask.sum().item()
+                                total_tokens = replace_mask.numel()
                                 print(
                                     f"[P2P-Attn] Scale {si}: "
                                     f"Attention 遮罩替換 "
                                     f"{num_replaced}/{total_tokens} "
-                                    f"({100 * num_replaced / total_tokens:.1f}%)"
+                                    f"({100 * num_replaced / total_tokens:.1f}%, p_mean={prob_mean:.3f})"
                                 )
 
                         # ── 分支 C：Fallback → 機率替換 ──
@@ -877,6 +898,16 @@ class Infinity(nn.Module):
                             mode=vae.quantizer.z_interplote_up
                         )  # [B, d, 1, H_full, W_full]
                         summed_codes += interp_codes
+                        if img_feat.shape[-3:] != summed_codes.shape[-3:]:
+                            img_feat = F.interpolate(
+                                img_feat,
+                                size=summed_codes.shape[-3:],
+                                mode=vae.quantizer.z_interplote_up,
+                            )
+                            print(
+                                f"[P2P-Edit] Scale {si}: source feature 尺寸自動對齊 "
+                                f"-> {tuple(img_feat.shape[-3:])}"
+                            )
                         # 再將累積後的 summed_codes 與 img_feat 做 blend（取代，而非累加）
                         # img_feat 是 source image 的完整 encoder 輸出（= 理想的最終 summed_codes）
                         # inject_w=0.0 → 完全使用 source image；inject_w=1.0 → 完全自由生成

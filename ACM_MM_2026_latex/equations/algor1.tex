@@ -1,0 +1,14 @@
+\begin{algorithm}[t]
+\caption{Adaptive Mask Thresholding}
+\label{alg:adaptive_threshold}
+\small
+\begin{algorithmic}[1]
+\Require Filtered attention $\hat{a}_k$, base threshold $\tau_{\mathrm{base}}$, percentile range $[p_{\min}, p_{\max}]$
+\Ensure Adaptive threshold $\tau_k$
+
+\State $\rho \gets \frac{|\{i : \hat{a}_k[i] > \tau_{\mathrm{base}}\}|}{N_v}$ \Comment{hot-spot ratio}
+\State $p \gets p_{\min} + \rho \cdot (p_{\max} - p_{\min})$ \Comment{linear mapping}
+\State $\tau_k \gets \mathrm{Percentile}(\hat{a}_k,\; p)$
+\State \Return $\tau_k$
+\end{algorithmic}
+\end{algorithm}

@@ -1,0 +1,50 @@
+%% Eq_methods.tex
+%% Simplified equations for Section 4: Methodology
+%% Notation: r_k = source tokens at scale k,  A_k = cross-attention map,
+%%           a_{k,b} = per-block focus attention,  \hat{a}_k = IQR-filtered attention,
+%%           M_k^f = focus mask,  M_k^p = preserve mask,  M_k^rep = replacement mask,
+%%           g_k = generated target tokens,  r_k = final output tokens
+
+%% Eq. 1 — BSQ-VAE source image encoding
+\newcommand{\EqBsqEncode}{%
+\begin{equation}
+    \{r_k^s\}_{k=1}^{S} = \mathcal{Q}_{\mathrm{BSQ}}\!\bigl(\mathcal{E}(I_{\mathrm{src}})\bigr),
+    \label{eq:bsq_encode}
+\end{equation}}
+
+%% Eq. 2 — IQR fence: blocks retained after outlier removal
+\newcommand{\EqIqrFilter}{%
+\begin{equation}
+    \mathcal{B}_{\mathrm{keep}} = \bigl\{ b \;\big|\; e_b \leq Q_3 + 1.5\,(Q_3 - Q_1) \bigr\},
+    \label{eq:iqr_filter}
+\end{equation}}
+
+%% Eq. 3 — Filtered attention map (mean over retained blocks)
+\newcommand{\EqFilteredAttn}{%
+\begin{equation}
+    \hat{a}_k = \frac{1}{|\mathcal{B}_{\mathrm{keep}}|} \sum_{b \in \mathcal{B}_{\mathrm{keep}}} a_{k,b}.
+    \label{eq:filtered_attn}
+\end{equation}}
+
+%% Eq. 4 — Focus and preserve masks
+\newcommand{\EqMasks}{%
+\begin{equation}
+\begin{aligned}
+    M_k^{\mathrm{f}} &= \mathbf{1}\!\left[\hat{a}_k \ge \tau_k\right], \\
+    M_k^{\mathrm{p}} &= \mathbf{1}\!\left[\hat{a}_k \le \tau_k^{\mathrm{low}}\right].
+\end{aligned}
+\label{eq:masks}
+\end{equation}}
+
+%% Eq. 5 — Scale-wise selective token replacement
+\newcommand{\EqTokenReplace}{%
+\begin{equation}
+    r_k = \begin{cases}
+        r_k^s & \text{if } k < N \\[2pt]
+        M_k^{\mathrm{rep}} \odot r_k^s \;+\; (1{-}M_k^{\mathrm{rep}}) \odot g_k & \text{if } k \geq N
+    \end{cases}
+    \label{eq:token_replace}
+\end{equation}}
+
+%% --- Used in supplementary ---
+%% (Coverage ratio equation removed — replaced by adaptive thresholding)

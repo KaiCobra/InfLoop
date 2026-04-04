@@ -51,7 +51,12 @@ apply_spatial_patchify=0
 # • 設定路徑 → P2P-Edit 模式：source gen 注入 + P2P token 來自 source image 編碼
 # • 留空白   → 純 P2P-Attn 模式：P2P token 來自 source gen 採樣（與 run_p2p_attn.py 相同）
 source_image="./outputs/outputs_loop_exp/extracted_pie_bench/2_add_object_80/211000000000/image.jpg"
-source_image="./image.png"
+source_image="./image1.png"
+source_image="./outputs/outputs_loop_exp/extracted_pie_bench_dontUse/3_delete_object_80/321000000000/image.jpg"
+source_image="outputs/outputs_loop_exp/extracted_pie_bench_dontUse/3_delete_object_80/324000000007/image.jpg"  # 用此行可切換為純 P2P-Attn 模式
+
+# source_image="./outputs/outputs_loop_exp/extracted_pie_bench/9_change_style_80/922000000000/image.jpg"
+# source_image="./test.jpg"
 # source_image=""  # 用此行可切換為純 P2P-Attn 模式
 
 # 前幾個 scale 使用 source image 注入（weight=0 → 100% source image）
@@ -72,6 +77,17 @@ inject_weights="0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0"
 
 # ── Attention 遮罩參數 ──
 
+# 閾值方法（1~8）
+# 1 = 固定 percentile
+# 2 = Dynamic threshold（ternary search + reference mask，需搭配 PIE-Bench）
+# 3 = Otsu 最大類間方差法（無超參數）
+# 4 = FFT 低通去噪 + Otsu
+# 5 = Spectral Energy Ratio 自適應閾值
+# 6 = Source Image Edge-Attention 跨頻譜相干性（需 source_image）
+# 7 = GMM 雙高斯混合模型
+# 8 = 複合方案（Edge-Coherent → Otsu → R_k fallback）
+threshold_method=3
+
 # 前幾個 scale 做 100% source token 替換（p2p 模式時才生效）
 # 應與 image_injection_scales 保持一致
 num_full_replace_scales=2
@@ -79,7 +95,7 @@ num_full_replace_scales=2
 # Attention 閾值百分位數
 # 高於此百分位的空間位置被視為「focus 區域」（不替換）
 # 75 = 前 25% 最強 attention 視為 focus 區域
-attn_threshold_percentile=80
+attn_threshold_percentile=20
 
 # 用於計算 attention 遮罩的 transformer block 起始/結束 index
 # -1 = 自動（起始 = 模型深度的 1/2，結束 = 最後一個 block）
@@ -93,14 +109,32 @@ attn_batch_idx=0
 # Fallback 機率替換（當某個 scale 無 attention 遮罩時使用）
 p2p_token_replace_prob=0.0
 
-# Token + 遮罩資料儲存路徑
+# 是否啟用跨尺度累積機率遮罩
+# 1 = 當前 scale 使用前面所有 scale mask 疊加平均（灰階=替換機率）
+# 0 = 維持單一 scale 對單一 mask（bool）
+use_cumulative_prob_mask=0
+
+# Single-focus fallback（只有 target focus，無 source focus）時，
+# Phase 1.7 以 source gen token 替換前幾個 scale，讓 attention 擷取時有結構參考
+# 0 = 停用（純 free-gen）；建議值 4
+phase17_fallback_replace_scales=4
+
+# Debug mode：儲存所有中間過程圖片（Phase 1.7 guided gen、fallback gen）
+# 0 = 關閉；1 = 開啟
+debug_mode=1
 p2p_token_file="./tokens_p2p_edit.pkl"
 
 # 是否儲存 attention 遮罩視覺化
 save_attn_vis=1
+use_normalized_attn=0
+
+h_div_w_template="1.000"  # 可選：覆蓋輸入圖像的高寬比（h/w），用於調整 RoPE 位置編碼；留空表示不調整
 
 # ── Prompt 設定 ──
 # source_focus_words / target_focus_words：分別指定各自 prompt 中的 focus 詞彙
+# source_keep_words：source prompt 中欲保留的詞彙（高 attention → 錨定 source gen token）
+#   與 focus_words 篩掉 token 的邏輯相反：keep_words 的高 attention 區域會被保留
+#   即使沒有 source image，也能透過 source gen token 提供 Phase 1.7 結構錨定
 
 # source_prompt="a wathet bird sitting on a branch of yellow flowers"
 # target_prompt="a cupcake sitting on a branch of yellow flowers"
@@ -113,19 +147,56 @@ save_attn_vis=1
 # target_focus_words="and scarf with flowers in mouth"
 
 source_prompt="A oil paint of Girl with a Pearl Earring."
-target_prompt="A oil paint of Girl with thick eyebrows and a Pearl Earring."
-source_focus_words=""
-target_focus_words="with thick eyebrows"
+target_prompt="A oil paint of Green Frog with a Pearl Earring."
+source_focus_words="Girl"
+target_focus_words="Green Frog"
 
-source_prompt="A photo of a confident politician in a blue suit speaking at a microphone."
-target_prompt="A oil paint of a Green Frog in a blue suit speaking at a microphone."
-source_focus_words="photo confident politician"
-target_focus_words="oil paint Green Frog"
-
-source_prompt="A photo of Pimples"
-target_prompt="A photo of "
-source_focus_words="A photo of "
+source_prompt="a bee flies over a flowering tree branch."
+target_prompt="A tree branch."
+source_focus_words="bee flies over a flowering"
 target_focus_words=""
+
+source_prompt="a barn sits in the snow next to trees with gray sky"
+target_prompt="a barn sits in the snow with gray sky"
+source_focus_words="trees"
+target_focus_words=""
+
+# source_prompt="a slanted mountain bicycle on the road in front of a building"
+# target_prompt="a slanted rusty mountain motorcycle in front of a fence"
+# source_focus_words="mountain bicycle on the road building"
+# target_focus_words="rusty mountain motorcycle fence"
+
+# source_prompt="a woman in a blue dress leaning against a wall."
+# target_prompt="a pixel art of a anime woman in a blue dress leaning against a wall."
+# source_focus_words=""
+# target_focus_words="pixel art of a anime"
+# source_keep_words="woman blue dress wall"
+
+# source_prompt="This is a selfie of a young man, not a selfie of a young man with a crown."
+# target_prompt="This is a selfie of a young man with a crown, not a selfie of a young man."
+# source_focus_words="with a crown"
+# target_focus_words="with a crown"
+# source_keep_words="a selfie of a young man"
+
+# source_prompt="A photo of a confident politician in a blue suit speaking at a microphone."
+# target_prompt="A oil paint of a Green Frog in a blue suit speaking at a microphone."
+# source_focus_words="photo confident politician"
+# target_focus_words="oil paint Green Frog"
+
+# source_prompt="A photo of Pimples"
+# target_prompt="A photo of "
+# source_focus_words="A photo of "
+# target_focus_words=""
+
+# source_prompt="A photo of a politician in a blue suit."
+# target_prompt="A photo of a politician in a blue suit with golden crown."
+# source_focus_words=""
+# target_focus_words="with golden crown"
+
+# source_prompt="A oil paint of Woman smiling."
+# target_prompt="A oil paint of Woman smiling and holding a cat."
+# source_focus_words=""
+# target_focus_words="and holding a cat"
 
 # ── 其他範例 ──
 
@@ -171,16 +242,23 @@ python3 tools/run_p2p_edit.py \
   --target_prompt "${target_prompt}" \
   --source_focus_words "${source_focus_words}" \
   --target_focus_words "${target_focus_words}" \
+  --source_keep_words "${source_keep_words}" \
   ${source_image:+--source_image "${source_image}"} \
   ${source_image:+--image_injection_scales ${image_injection_scales}} \
   ${source_image:+--inject_weights "${inject_weights}"} \
   --num_full_replace_scales ${num_full_replace_scales} \
+  --threshold_method ${threshold_method} \
   --attn_threshold_percentile ${attn_threshold_percentile} \
   --attn_block_start ${attn_block_start} \
   --attn_block_end ${attn_block_end} \
   --attn_batch_idx ${attn_batch_idx} \
   --p2p_token_replace_prob ${p2p_token_replace_prob} \
+  --use_cumulative_prob_mask ${use_cumulative_prob_mask} \
+  --phase17_fallback_replace_scales ${phase17_fallback_replace_scales} \
+  --debug_mode ${debug_mode} \
   --p2p_token_file ${p2p_token_file} \
   --save_attn_vis ${save_attn_vis} \
+  --use_normalized_attn ${use_normalized_attn} \
   --save_file ${save_file} \
-  --seed 1
+  --seed 1 \
+  --h_div_w_template ${h_div_w_template}

@@ -1,0 +1,38 @@
+\begin{table}[t]
+\centering
+\caption{Ablation studies on attention mask construction (AMC). Best in \textbf{bold}.}
+\label{tab:ablation_amc}
+\small
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l|cccc|cc}
+\toprule
+Method & S.D.$\downarrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & CLIPw$\uparrow$ & CLIPe$\uparrow$ \\
+\midrule
+Adaptive          & \textbf{0.0316} & \textbf{23.44} & \textbf{0.8565} & \textbf{0.0833} & \textbf{0.2613} & \textbf{0.2290} \\
+90\% (fixed)     & 0.0484 & 23.01 & 0.8357 & 0.0945 & 0.2578 & 0.2246 \\
+80\% (fixed)     & 0.0482 & 22.15 & 0.8029 & 0.1024 & 0.2537 & 0.2205 \\
+70\% (fixed)     & 0.0489 & 21.02 & 0.7684 & 0.1135 & 0.2468 & 0.2157 \\
+\bottomrule
+\end{tabular}%
+}
+
+\vspace{2pt}
+\centerline{(a) Adaptive vs.\ fixed-percentile thresholding.}
+
+\vspace{6pt}
+
+\resizebox{\linewidth}{!}{%
+\begin{tabular}{l|cccc|cc}
+\toprule
+Method & S.D.$\downarrow$ & PSNR$\uparrow$ & SSIM$\uparrow$ & LPIPS$\downarrow$ & CLIPw$\uparrow$ & CLIPe$\uparrow$ \\
+\midrule
+With IQR  & \textbf{0.0316} & \textbf{23.44} & \textbf{0.8565} & \textbf{0.0833} & \textbf{0.2613} & \textbf{0.2290} \\
+W/O IQR   & 0.0328 & 20.56 & 0.7872 & 0.1285 & 0.2550 & 0.2260 \\
+\bottomrule
+\end{tabular}%
+}
+
+\vspace{2pt}
+\centerline{(b) Ablation on IQR filtering.}
+
+\end{table}

@@ -1,0 +1,643 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PIE Model Comparison Viewer</title>
+  <style>
+    :root {
+      --bg: #0f1220;
+      --panel: #171b2d;
+      --panel2: #1f2540;
+      --line: #313956;
+      --text: #ebefff;
+      --muted: #a5afcf;
+      --accent: #71c7ff;
+      --accent2: #9ecb7f;
+      --danger: #ff6b6b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      min-height: 100vh;
+    }
+
+    /* Top bar */
+    .topbar {
+      position: sticky; top: 0; z-index: 100;
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      padding: 10px 16px;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    }
+    .topbar .title {
+      font-size: 1.05rem; font-weight: 700; color: var(--accent);
+      margin-right: 12px; white-space: nowrap;
+    }
+    .topbar select {
+      background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+      padding: 5px 10px; border-radius: 4px; font-size: 0.85rem;
+    }
+    .topbar label { font-size: 0.84rem; color: var(--muted); cursor: pointer; white-space: nowrap; }
+    .topbar label input { margin-right: 4px; accent-color: var(--accent); }
+    .topbar .sep { width: 1px; height: 24px; background: var(--line); }
+
+    /* Controls row */
+    .controls {
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
+      padding: 8px 16px;
+      display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+    }
+    .controls .lbl { font-size: 0.82rem; color: var(--accent); font-weight: 600; margin-right: 4px; }
+    .model-chip {
+      display: inline-flex; align-items: center; gap: 4px;
+      background: var(--panel2); border: 1px solid var(--line);
+      padding: 3px 10px; border-radius: 14px; font-size: 0.8rem;
+      cursor: pointer; user-select: none; transition: all .15s;
+    }
+    .model-chip.active { border-color: var(--accent); background: rgba(113,199,255,0.12); color: var(--accent); }
+    .model-chip:hover { border-color: var(--accent); }
+    .model-chip input { display: none; }
+
+    .btn {
+      background: var(--panel2); color: var(--accent); border: 1px solid var(--line);
+      padding: 4px 12px; border-radius: 4px; font-size: 0.8rem; cursor: pointer;
+      transition: all .15s;
+    }
+    .btn:hover { background: rgba(113,199,255,0.12); border-color: var(--accent); }
+    .btn.active { background: rgba(113,199,255,0.2); border-color: var(--accent); }
+
+    /* Image size slider */
+    .size-ctrl {
+      display: flex; align-items: center; gap: 6px; margin-left: auto;
+    }
+    .size-ctrl label { font-size: 0.78rem; color: var(--muted); }
+    .size-ctrl input[type=range] { width: 100px; accent-color: var(--accent); }
+
+    /* Main content */
+    .content { padding: 16px; }
+    .loading { text-align: center; padding: 60px; color: var(--muted); font-size: 0.9rem; }
+
+    /* Task row */
+    .task-row {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      margin-bottom: 12px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      overflow-x: auto;
+    }
+    .task-row:hover { border-color: #404a70; }
+
+    .task-label {
+      min-width: 110px;
+      font-size: 0.76rem;
+      color: var(--muted);
+      flex-shrink: 0;
+      text-align: center;
+    }
+    .task-label .tid { font-weight: 700; color: var(--text); font-size: 0.84rem; }
+
+    .img-cell {
+      flex-shrink: 0;
+      text-align: center;
+      position: relative;
+    }
+    .img-cell img {
+      border-radius: 4px;
+      object-fit: contain;
+      background: #111;
+      cursor: pointer;
+      transition: transform .2s;
+      display: block;
+    }
+    .img-cell img:hover { transform: scale(1.03); }
+    .img-cell .img-label {
+      font-size: 0.68rem;
+      color: var(--muted);
+      margin-top: 2px;
+      text-align: center;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .img-cell.source-cell .img-label { color: var(--accent2); }
+
+    .copy-btn {
+      flex-shrink: 0;
+      background: var(--panel2);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      width: 36px; height: 36px;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      transition: all .15s;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+    .copy-btn:hover { border-color: var(--accent); color: var(--accent); background: rgba(113,199,255,0.1); }
+    .copy-btn.copied { border-color: var(--accent2); color: var(--accent2); }
+    .copy-btn svg { width: 18px; height: 18px; }
+
+    .task-info {
+      flex-shrink: 0;
+      min-width: 220px;
+      max-width: 350px;
+      font-size: 0.72rem;
+      color: var(--muted);
+      line-height: 1.5;
+      padding: 4px 8px;
+      background: var(--panel2);
+      border-radius: 6px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 180px;
+      overflow-y: auto;
+    }
+    .task-info .src-prompt { color: var(--accent2); }
+    .task-info .tgt-prompt { color: var(--accent); }
+    .task-info strong { color: var(--text); }
+
+    /* Category header */
+    .cat-header {
+      font-size: 1rem; font-weight: 700;
+      color: var(--accent);
+      padding: 16px 0 8px;
+      border-bottom: 1px solid var(--line);
+      margin-bottom: 12px;
+      display: flex; align-items: center; gap: 10px;
+    }
+    .cat-header .count { font-size: 0.8rem; color: var(--muted); font-weight: 400; }
+
+    /* Lightbox */
+    .lightbox {
+      display: none; position: fixed; inset: 0; z-index: 500;
+      background: rgba(0,0,0,0.85);
+      align-items: center; justify-content: center;
+      cursor: zoom-out;
+    }
+    .lightbox.show { display: flex; }
+    .lightbox img { max-width: 92vw; max-height: 92vh; border-radius: 6px; }
+
+    /* Toast */
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; z-index: 600;
+      background: var(--accent2); color: #111;
+      padding: 8px 18px; border-radius: 6px;
+      font-size: 0.84rem; font-weight: 600;
+      opacity: 0; transform: translateY(12px);
+      transition: all .3s;
+      pointer-events: none;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<div class="topbar">
+  <span class="title">PIE Model Comparison</span>
+  <select id="catSelect"></select>
+  <div class="sep"></div>
+  <label><input type="checkbox" id="showMask"> Show Mask</label>
+</div>
+
+<div class="controls" id="modelControls">
+  <span class="lbl">Flow Models:</span>
+  <span id="flowChips"></span>
+  <div class="sep" style="width:1px;height:20px;background:var(--line);margin:0 4px"></div>
+  <span class="lbl" style="color:var(--accent2)">Eval Models:</span>
+  <span id="evalChips"></span>
+</div>
+
+<div class="controls" id="benchControls">
+  <span class="lbl" style="color:var(--danger)">Bench Models:</span>
+  <span id="benchChips"></span>
+</div>
+
+<div class="controls" style="border-bottom: none; padding-top: 4px;">
+  <button class="btn" id="selectAll">Select All</button>
+  <button class="btn" id="selectNone">Deselect All</button>
+  <div class="size-ctrl">
+    <label>Image Size:</label>
+    <input type="range" id="imgSize" min="80" max="400" value="180" step="10">
+    <span id="imgSizeVal" style="font-size:0.78rem;color:var(--muted);min-width:36px;">180px</span>
+  </div>
+</div>
+
+<div class="content" id="content">
+  <div class="loading">Loading...</div>
+</div>
+
+<div class="lightbox" id="lightbox"><img id="lightboxImg" src=""></div>
+<div class="toast" id="toast">Copied!</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const $$ = s => document.querySelectorAll(s);
+
+let flowModels = [];
+let evalModels = [];
+let benchModels = [];
+let selectedFlowModels = new Set();
+let selectedEvalModels = new Set();
+let selectedBenchModels = new Set();
+let categories = [];
+let currentCategory = '';
+let imgSize = 180;
+let showMask = false;
+let taskDataCache = {};
+
+// ---- Init ----
+async function init() {
+  const [mRes, cRes] = await Promise.all([
+    fetch('/api/models').then(r => r.json()),
+    fetch('/api/categories').then(r => r.json()),
+  ]);
+  flowModels = mRes.flow_models;
+  evalModels = mRes.eval_models;
+  benchModels = mRes.bench_models || [];
+  categories = cRes.categories;
+
+  // category dropdown
+  const sel = $('#catSelect');
+  categories.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = c; opt.textContent = c;
+    sel.appendChild(opt);
+  });
+  sel.addEventListener('change', () => { currentCategory = sel.value; loadBatch(); });
+
+  // model chips
+  buildModelChips($('#flowChips'), flowModels, selectedFlowModels, 'flow');
+  buildModelChips($('#evalChips'), evalModels, selectedEvalModels, 'eval');
+  buildModelChips($('#benchChips'), benchModels, selectedBenchModels, 'bench');
+
+  // select flow + eval by default, bench NOT selected
+  flowModels.forEach(m => selectedFlowModels.add(m));
+  evalModels.forEach(m => selectedEvalModels.add(m));
+  syncChips();
+
+  // controls
+  $('#selectAll').onclick = () => {
+    flowModels.forEach(m => selectedFlowModels.add(m));
+    evalModels.forEach(m => selectedEvalModels.add(m));
+    benchModels.forEach(m => selectedBenchModels.add(m));
+    syncChips(); loadBatch();
+  };
+  $('#selectNone').onclick = () => {
+    selectedFlowModels.clear(); selectedEvalModels.clear(); selectedBenchModels.clear();
+    syncChips(); loadBatch();
+  };
+  $('#imgSize').oninput = e => { imgSize = +e.target.value; $('#imgSizeVal').textContent = imgSize + 'px'; applyImgSize(); };
+  $('#showMask').onchange = e => { showMask = e.target.checked; renderTasks(); };
+
+  // lightbox
+  $('#lightbox').onclick = () => $('#lightbox').classList.remove('show');
+
+  currentCategory = categories[0] || '';
+  sel.value = currentCategory;
+  loadBatch();
+}
+
+function buildModelChips(container, models, selectedSet, group) {
+  models.forEach(m => {
+    const chip = document.createElement('label');
+    chip.className = 'model-chip';
+    chip.dataset.group = group;
+    chip.innerHTML = `<input type="checkbox" value="${m}" data-group="${group}"><span>${m}</span>`;
+    chip.querySelector('input').addEventListener('change', e => {
+      if (e.target.checked) selectedSet.add(m);
+      else selectedSet.delete(m);
+      syncChips();
+      loadBatch();
+    });
+    container.appendChild(chip);
+  });
+}
+
+function syncChips() {
+  $$('.model-chip').forEach(chip => {
+    const cb = chip.querySelector('input');
+    const group = cb.dataset.group;
+    const set = group === 'flow' ? selectedFlowModels : group === 'eval' ? selectedEvalModels : selectedBenchModels;
+    const active = set.has(cb.value);
+    cb.checked = active;
+    chip.classList.toggle('active', active);
+  });
+}
+
+async function loadBatch() {
+  if (!currentCategory) return;
+  const flowStr = [...selectedFlowModels].join(',');
+  const evalStr = [...selectedEvalModels].join(',');
+  const benchStr = [...selectedBenchModels].join(',');
+  $('#content').innerHTML = '<div class="loading">Loading...</div>';
+
+  const res = await fetch(`/api/batch?category=${encodeURIComponent(currentCategory)}&flow_models=${encodeURIComponent(flowStr)}&eval_models=${encodeURIComponent(evalStr)}&bench_models=${encodeURIComponent(benchStr)}`);
+  const data = await res.json();
+  taskDataCache = {};
+  data.tasks.forEach(t => { taskDataCache[t.task_id] = t; });
+  renderTasks(data);
+}
+
+function renderTasks(data) {
+  if (!data && !Object.keys(taskDataCache).length) return;
+  if (!data) {
+    const tasks = Object.values(taskDataCache);
+    data = { category: currentCategory, flow_models: [...selectedFlowModels], eval_models: [...selectedEvalModels], bench_models: [...selectedBenchModels], tasks };
+  }
+  const ct = $('#content');
+  ct.innerHTML = '';
+
+  const fm = (data.flow_models || []).filter(m => selectedFlowModels.has(m));
+  const em = (data.eval_models || []).filter(m => selectedEvalModels.has(m));
+  const bm = (data.bench_models || []).filter(m => selectedBenchModels.has(m));
+
+  // header
+  const hdr = document.createElement('div');
+  hdr.className = 'cat-header';
+  hdr.innerHTML = `<span>${data.category}</span><span class="count">${data.tasks.length} tasks</span>`;
+  ct.appendChild(hdr);
+
+  data.tasks.forEach(task => {
+    const row = document.createElement('div');
+    row.className = 'task-row';
+
+    // task label
+    const lbl = document.createElement('div');
+    lbl.className = 'task-label';
+    lbl.innerHTML = `<div class="tid">${task.task_id.replace(/^0+/, '') || '0'}</div><div>${data.category}</div>`;
+    row.appendChild(lbl);
+
+    // source image
+    if (task.source) {
+      row.appendChild(makeImgCell(task.source, 'Source', true));
+    }
+
+    // mask (optional)
+    if (showMask && task.mask) {
+      row.appendChild(makeImgCell(task.mask, 'Mask', false));
+    }
+
+    // Flow model results
+    fm.forEach(m => {
+      const url = task.flow_results ? task.flow_results[m] : null;
+      if (url) {
+        row.appendChild(makeImgCell(url, m, false));
+      } else {
+        row.appendChild(makePlaceholder(m));
+      }
+    });
+
+    // Separator between flow and eval
+    if (fm.length > 0 && em.length > 0) {
+      row.appendChild(makeSep('var(--accent2)'));
+    }
+
+    // Eval model results
+    em.forEach(m => {
+      const url = task.eval_results ? task.eval_results[m] : null;
+      if (url) {
+        row.appendChild(makeImgCell(url, m, false, true));
+      } else {
+        row.appendChild(makePlaceholder(m));
+      }
+    });
+
+    // Separator before bench
+    if ((fm.length > 0 || em.length > 0) && bm.length > 0) {
+      row.appendChild(makeSep('var(--danger)'));
+    }
+
+    // Bench model results
+    bm.forEach(m => {
+      const url = task.bench_results ? task.bench_results[m] : null;
+      if (url) {
+        row.appendChild(makeImgCell(url, shortBenchName(m), false, false, true));
+      } else {
+        row.appendChild(makePlaceholder(shortBenchName(m)));
+      }
+    });
+
+    // copy button
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'copy-btn';
+    copyBtn.title = 'Copy row images';
+    copyBtn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
+    copyBtn.onclick = () => copyRowImages(task, fm, em, bm, copyBtn);
+    row.appendChild(copyBtn);
+
+    // task info
+    const info = document.createElement('div');
+    info.className = 'task-info';
+    let infoHtml = '';
+    if (task.meta) {
+      const m = task.meta;
+      // Support both formats: source_prompt/target_prompt (old) and original_prompt/editing_prompt (v1)
+      const srcP = m.source_prompt || m.original_prompt;
+      const tgtP = m.target_prompt || m.editing_prompt;
+      if (srcP) infoHtml += `<strong>Source:</strong> <span class="src-prompt">${esc(srcP)}</span>\n`;
+      if (tgtP) infoHtml += `<strong>Target:</strong> <span class="tgt-prompt">${esc(tgtP)}</span>\n`;
+      if (m.editing_instruction) infoHtml += `<strong>Instruction:</strong> <span class="tgt-prompt">${esc(m.editing_instruction)}</span>\n`;
+      if (m.edit_action) {
+        infoHtml += `<strong>Edits:</strong>\n`;
+        for (const [key, val] of Object.entries(m.edit_action)) {
+          const action = val.action === '+' ? 'add' : val.action === '-' ? 'delete' : `${val.action} → ${key}`;
+          infoHtml += `  ${key}: ${action}\n`;
+        }
+      }
+    }
+    // show eval info.txt if available
+    if (task.eval_info) {
+      const firstInfo = Object.values(task.eval_info)[0];
+      if (firstInfo) {
+        if (infoHtml) infoHtml += '\n';
+        if (firstInfo.editing_instruction) infoHtml += `<strong>Instruction:</strong> <span class="tgt-prompt">${esc(firstInfo.editing_instruction)}</span>\n`;
+        if (firstInfo.editing_prompt) infoHtml += `<strong>Edit Prompt:</strong> <span class="tgt-prompt">${esc(firstInfo.editing_prompt)}</span>\n`;
+        if (firstInfo.original_prompt && !task.meta?.source_prompt) infoHtml += `<strong>Original:</strong> <span class="src-prompt">${esc(firstInfo.original_prompt)}</span>\n`;
+      }
+    }
+    info.innerHTML = infoHtml || 'No meta info';
+    row.appendChild(info);
+
+    ct.appendChild(row);
+  });
+}
+
+function makeSep(color) {
+  const sep = document.createElement('div');
+  sep.style.cssText = `width:2px;align-self:stretch;background:${color};border-radius:1px;flex-shrink:0;opacity:0.4;`;
+  return sep;
+}
+
+function shortBenchName(name) {
+  return name.replace(/^pie_bench_/, '');
+}
+
+function makePlaceholder(modelName) {
+  const placeholder = document.createElement('div');
+  placeholder.className = 'img-cell';
+  placeholder.style.width = imgSize + 'px';
+  placeholder.style.height = imgSize + 'px';
+  placeholder.style.display = 'flex';
+  placeholder.style.alignItems = 'center';
+  placeholder.style.justifyContent = 'center';
+  placeholder.style.background = 'var(--panel2)';
+  placeholder.style.borderRadius = '4px';
+  placeholder.style.flexShrink = '0';
+  placeholder.innerHTML = `<div style="color:var(--muted);font-size:0.72rem;text-align:center;">${modelName}<br>N/A</div>`;
+  return placeholder;
+}
+
+function makeImgCell(src, label, isSource, isEval, isBench) {
+  const cell = document.createElement('div');
+  cell.className = 'img-cell' + (isSource ? ' source-cell' : '');
+  const img = document.createElement('img');
+  img.src = src;
+  img.style.width = imgSize + 'px';
+  img.style.height = imgSize + 'px';
+  img.loading = 'lazy';
+  img.onclick = () => openLightbox(src);
+  cell.appendChild(img);
+  const lbl = document.createElement('div');
+  lbl.className = 'img-label';
+  lbl.textContent = label;
+  if (isEval) lbl.style.color = 'var(--accent2)';
+  if (isBench) lbl.style.color = 'var(--danger)';
+  cell.appendChild(lbl);
+  return cell;
+}
+
+function buildTaskInfoHtml(meta) {
+  let html = '';
+  if (meta.source_prompt) html += `<strong>Source:</strong> <span class="src-prompt">${esc(meta.source_prompt)}</span>\n`;
+  if (meta.target_prompt) html += `<strong>Target:</strong> <span class="tgt-prompt">${esc(meta.target_prompt)}</span>\n`;
+  if (meta.edit_action) {
+    html += `<strong>Edits:</strong>\n`;
+    for (const [key, val] of Object.entries(meta.edit_action)) {
+      const action = val.action === '+' ? 'add' : val.action === '-' ? 'delete' : `${val.action} → ${key}`;
+      html += `  ${key}: ${action}\n`;
+    }
+  }
+  return html;
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+function applyImgSize() {
+  $$('.img-cell img').forEach(img => { img.style.width = imgSize + 'px'; img.style.height = imgSize + 'px'; });
+}
+
+function openLightbox(src) {
+  $('#lightboxImg').src = src;
+  $('#lightbox').classList.add('show');
+}
+
+async function copyRowImages(task, fm, em, bm, btn) {
+  // Collect image URLs: source + all model targets
+  const urls = [];
+  if (task.source) urls.push(task.source);
+  if (showMask && task.mask) urls.push(task.mask);
+  fm.forEach(m => {
+    if (task.flow_results && task.flow_results[m]) urls.push(task.flow_results[m]);
+  });
+  em.forEach(m => {
+    if (task.eval_results && task.eval_results[m]) urls.push(task.eval_results[m]);
+  });
+  bm.forEach(m => {
+    if (task.bench_results && task.bench_results[m]) urls.push(task.bench_results[m]);
+  });
+
+  if (urls.length === 0) { showToast('No images to copy'); return; }
+
+  try {
+    // Load all images
+    const images = await Promise.all(urls.map(loadImage));
+    // Normalize all images to same height
+    const targetH = 512;
+    const gap = 4;
+    let totalW = gap * (images.length - 1);
+    const drawInfos = images.map(img => {
+      const scale = targetH / img.naturalHeight;
+      const w = Math.round(img.naturalWidth * scale);
+      totalW += w;
+      return { img, w, h: targetH };
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = totalW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#0f1220';
+    ctx.fillRect(0, 0, totalW, targetH);
+
+    let x = 0;
+    drawInfos.forEach(({ img, w, h }) => {
+      ctx.drawImage(img, x, 0, w, h);
+      x += w + gap;
+    });
+
+    // Try clipboard API first, fallback to opening in new tab
+    try {
+      const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+      btn.classList.add('copied');
+      showToast('Copied to clipboard!');
+      setTimeout(() => btn.classList.remove('copied'), 1500);
+    } catch (clipErr) {
+      console.warn('Clipboard API failed, opening in new tab:', clipErr);
+      // Fallback: open as data URL in new tab
+      const dataUrl = canvas.toDataURL('image/png');
+      const w = window.open();
+      if (w) {
+        w.document.write(`<img src="${dataUrl}" style="max-width:100%">`);
+        w.document.title = 'Copy this image (Ctrl+A, Ctrl+C)';
+        showToast('Opened in new tab - right-click to copy');
+      } else {
+        // Last resort: download
+        const a = document.createElement('a');
+        a.href = dataUrl;
+        a.download = `compare_${task.task_id}.png`;
+        a.click();
+        showToast('Downloaded as image');
+      }
+    }
+  } catch (e) {
+    console.error('Image load failed:', e);
+    showToast('Failed to load images');
+  }
+}
+
+function loadImage(src) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+function showToast(msg) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 1600);
+}
+
+init();
+</script>
+</body>
+</html>

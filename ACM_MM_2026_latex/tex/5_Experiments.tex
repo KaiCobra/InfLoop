@@ -1,0 +1,80 @@
+\section{Experiments and Discussions}
+\label{section:exp}
+\input{tabs/relatedWorksComparison}
+
+\subsection{Experimental Settings}
+
+\noindent\textbf{Benchmark.}
+We evaluate on PIE-Bench~\cite{PIEBench}, a comprehensive benchmark comprising 700 images (both natural and artificial) across 10 editing categories, including object replacement, addition, removal, attribute modification, and style transfer.
+
+\noindent\textbf{Metrics.}
+Following prior work~\cite{PIEBench,AREdit}, we adopt six metrics grouped into two aspects. For \textit{background preservation}, we report Structure Distance~\cite{PIEBench} (S.D.), PSNR, SSIM, and LPIPS~\cite{LPIPS}. For \textit{editing quality}, we report CLIP similarity~\cite{CLIP} on both the whole image (CLIP whole) and the edited region (CLIP edited). All metrics are computed using the official PIE-Bench evaluation pipeline. Inference time per image is also reported.
+
+\noindent\textbf{Baselines.}
+We compare with 11 training-free editing methods spanning three architectural families: six diffusion-based — Prompt-to-Prompt~\cite{prompt2prompt}, Pix2Pix-Zero~\cite{pix2pix-zero}, MasaCtrl~\cite{masactrl}, PnP~\cite{PnP}, PnP Inversion~\cite{PnP_Inversion}, and LEDits++~\cite{LEDits++} — four flow-based — FlowEdit~\cite{Flowedit}, RF-Inversion~\cite{RF-inversion}, ReFlex~\cite{ReFlex}, and FireFlow~\cite{FireFlow} — and one autoregressive method, AREdit~\cite{AREdit}. Baseline results are obtained using officially released code under default settings, except AREdit whose results are cited directly from the original paper as no official implementation has been released.
+
+\noindent\textbf{Implementation details.}
+We build upon Infinity~\cite{Infinity} (2B parameters) with BSQ-VAE~\cite{BSQVAE} ($d{=}32$). Generation uses $S{=}13$ scales ($1{\times}1$ to $64{\times}64$), CFG scale 4.0, and temperature $\tau{=}0.5$. Text conditioning uses Flan-T5-XL~\cite{flan-t5}. We set $N{=}2$ full-replace scales. For binarization, we use adaptive thresholding that adjusts the percentile parameter $p$ based on the attention distribution of each image (see Sec.~\ref{sec:mask_construction}). For IQR filtering, we discard transformer blocks whose attention deviation from the cross-block mean exceeds the IQR fence (Sec.~\ref{sec:mask_construction}), using blocks 2--31 of the 32-block model (blocks 0--1 are excluded as they consistently exhibit the global attention effect described in Sec.~\ref{sec:mask_construction}). All experiments run on a single NVIDIA RTX 5090 GPU with ${\sim}$2.5\,s inference per image.
+
+
+\subsection{Comparison with State-of-the-Art Methods}
+
+\noindent\textbf{Quantitative results.}
+Table~\ref{tab:method_comparison_wo_kvedit} summarizes the comparison. Our method achieves the best SSIM (0.8565) and LPIPS (0.0833) among all methods, and the second-best CLIP whole (0.2613) and CLIP edited (0.2290), demonstrating strong background preservation and competitive edit quality with only 2B parameters — 6$\times$ fewer than all flow-based baselines.
+
+\textit{vs.\ diffusion-based methods.}
+Compared to the best diffusion-based method PnP Inversion, we improve SSIM by 7.5\% and LPIPS by 21.5\% while achieving higher CLIP scores on both whole-image and edited-region metrics.
+
+\textit{vs.\ flow-based methods.}
+Against the strongest flow-based competitor ReFlex, we attain better SSIM and LPIPS despite the 6$\times$ parameter gap, though ReFlex achieves higher PSNR.
+
+\textit{vs.\ AREdit.}
+Compared to AREdit~\cite{AREdit}, a VAR-based method with the same 2B backbone, we achieve uniformly better metrics across all six measures, validating the effectiveness of attention-driven mask construction over cached token statistics.
+
+We report inference time for reference, but note that methods operate at different resolutions.
+
+\input{imgs/qualitative}
+
+\noindent\textbf{Qualitative results.}
+Fig.~\ref{fig:qualitative} presents representative visual comparisons. Diffusion-based methods often suffer from structural drift or incomplete edits due to inversion errors: P2P and Pix2Pix-Zero alter the global layout, while MasaCtrl preserves structure but produces blurry edited regions. Among flow-based methods, ReFlex achieves the best preservation but occasionally misses fine-grained edit details. In contrast, our method produces clean, precisely localized edits while faithfully preserving the background, benefiting from explicit attention-driven masking and discrete token replacement.
+
+
+\subsection{Ablation Studies}
+\label{sec:ablation}
+
+\noindent\textbf{Effect of attention-based masking.}
+We compare our full pipeline against a variant that disables attention masks (Scale-$N$): the pipeline is identical to ours, but only the first $N$ scales share source tokens via full replacement while all subsequent scales generate freely under $P_t$ with no spatial guidance. We vary $N \in \{1, 2, 4, 6\}$.
+
+\input{tabs/p2pAndAttnMask}
+
+As shown in Table~\ref{tab:ablation_mask}, increasing shared scales progressively improves preservation, but gains saturate: even at $N{=}6$ (nearly half of 13 scales), SSIM reaches only 0.553, because scales beyond $N$ generate independently with no source reference. Our attention-masked method provides per-token spatial guidance at every scale, improving SSIM by 55\% and LPIPS by 67.5\% over the best Scale-$N$ variant, demonstrating that spatially precise masks are far more effective than indiscriminate scale-level replacement.
+Qualitatively, few shared scales degrade the background, while many shared scales prevent editing since the global layout is already locked. VAR commits to structure in the earliest scales, so shape-changing edits require modifying early tokens — which uniform replacement cannot accommodate. Our attention-mask approach resolves this tension by selectively replacing only background tokens, achieving both faithful editing and preservation. We provide detailed visual analysis in the supplementary material.
+
+%  ========== phase 2 ablation
+\noindent\textbf{Effect of Phase~2.}
+Phase~2 performs a second generation pass under the target prompt to extract the target focus mask $M_{k,t}^{\mathrm{f}}$ before token replacement (Sec.~\ref{sec:pipeline}). We compare our full three-phase pipeline against a variant that skips Phase~2.
+
+\input{tabs/ablationPhase2}
+
+As shown in Table~\ref{tab:ablation_phase2}, Phase~2 yields the largest single-component improvement: PSNR increases by 37.7\% and SSIM by 37.5\%, while LPIPS drops by 59.3\% and Structure Distance decreases by 39.0\%. CLIP scores also improve by 3.5--3.6\%. These results confirm that the source-side mask alone cannot accurately delineate editing boundaries — particularly when the target introduces new spatial content absent in the source. The dual-stream mask construction of Phases~1--2 is essential for preventing background drift while enabling precise editing.
+
+\noindent\textbf{Effect of adaptive thresholding.}
+A key hyperparameter in our pipeline is the binarization threshold that converts continuous attention maps into discrete edit/preserve masks. We compare our adaptive thresholding strategy — which adjusts the percentile parameter based on the attention distribution of each image — against fixed-percentile thresholds at 70\%, 80\%, and 90\%.
+
+\input{tabs/ablationThreshold}
+
+As shown in Table~\ref{tab:ablation_amc}(a), adaptive thresholding outperforms all fixed-percentile variants across every metric, achieving the lowest Structure Distance (0.0316 vs.\ 0.0482--0.0489) and the best preservation and edit quality scores. Among fixed variants, performance degrades monotonically from 90\% to 70\%, confirming that no single percentile universally accommodates the diversity of attention distributions across images and edit types.
+
+\input{imgs/ablationDynamic}
+
+Fig.~\ref{fig:ablationDynamic} illustrates this qualitatively: adaptive thresholding produces fine-grained masks that adapt to each image's attention distribution, preserving subtle details such as thin branches. Fixed thresholds at 70--80\% yield overly coarse masks with significant background structure loss, while 90\% is reasonable but still misses fine details.
+
+\noindent\textbf{Effect of IQR filtering.}
+Not all transformer blocks produce equally informative attention maps. As described in Sec.~\ref{sec:mask_construction}, we measure each block's deviation from the cross-block mean and discard outlier blocks whose deviation exceeds the IQR fence. We compare our full model (IQR-filtered, blocks 2--31) against naively averaging all 32 blocks.
+
+As shown in Table~\ref{tab:ablation_amc}(b), IQR filtering yields substantial improvements: PSNR increases by 14.0\% and SSIM by 8.8\%, while LPIPS drops by 35.2\%, confirming that filtered masks avoid corrupting non-target regions. Even Structure Distance improves (0.0328$\to$0.0316), showing that cleaner masks also reduce unintended structural changes.
+
+\input{imgs/ablationIQR}
+
+Fig.~\ref{fig:ablationIQR} illustrates this: without filtering, noisy attention from uninformative blocks produces imprecise masks that distort the bicycle structure; with IQR filtering, the mask cleanly delineates the target, preserving fine structural details.
+

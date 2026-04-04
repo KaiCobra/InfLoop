@@ -1,39 +1,41 @@
 #!/bin/bash
 # ==============================================================================
-# eval_pie.sh — PIE-Bench 結果定量評估啟動腳本
+# eval_pie.sh — 使用官方 PnPInversion evaluate.py 評估 PIE-Bench 結果
 #
-# 評估指標：
-#   背景保留（Background Preservation，基於 mask.png 遮罩）：
-#     PSNR  ↑  比較 source vs edited 的背景區域
-#     SSIM  ↑  比較 source vs edited 的背景區域
-#     LPIPS ↓  比較 source vs edited 的背景區域
+# 評估指標（官方 8 項）：
+#   structure_distance          ↓  DINO ViT-B/8 key self-similarity MSE（全圖）
+#   psnr_unedit_part            ↑  背景 PSNR
+#   lpips_unedit_part           ↓  背景 LPIPS（SqueezeNet）
+#   mse_unedit_part             ↓  背景 MSE
+#   ssim_unedit_part            ↑  背景 SSIM
+#   clip_similarity_source_image   CLIP(edited, source_prompt)
+#   clip_similarity_target_image ↑  CLIP(edited, target_prompt)
+#   clip_similarity_target_image_edit_part ↑  CLIP(edited_region, target_prompt)
 #
-#   結構保留（Structure Preservation，使用全圖）：
-#     StructDist ↓  DINO ViT-S/8 key-feature MSE（source vs edited）
+# result_format 兩種模式：
 #
-#   編輯對齊（Edit Alignment）：
-#     CLIP sim ↑  edited image（target.jpg）vs target_prompt 文字
+#   "batch_run" — 我們的 batch_run_pie_edit.py 輸出格式：
+#       result_dir/<category>/<case_id>/target.jpg  （需要重組）
 #
-# 輸出：
-#   outputs/eval_pie/per_case.csv     — 每個案例的詳細數字
-#   outputs/eval_pie/summary.json     — 每個 category 的平均 + 全域平均
+#   "direct" — 已是官方 PnPInversion 格式（leditspp、fireflow 等比較方法）：
+#       result_dir/annotation_images/<image_path>   （直接使用）
 #
 # 使用方式：
 #   bash scripts/eval_pie.sh
-#
-# 前置需求（首次執行自動安裝）：
-#   pip install lpips open-clip-torch
 # ==============================================================================
 
 # ── 自動安裝評估套件 ──
 echo "[Setup] 檢查並安裝評估套件..."
 pip install -q lpips open-clip-torch
 
+
+threshold_method=1
+
 # ── 路徑設定 ──
-bench_dir="./outputs/outputs_loop_exp/extracted_pie_bench"
-result_dir="outputs/outputs_loop_exp/pie_bench_results_pieMaskRatio"
-output_csv="./outputs/eval_pieMaskRatio/per_case.csv"
-summary_json="./outputs/eval_pieMaskRatio/summary.json"
+bench_dir="./outputs/outputs_loop_exp/PIE-Bench_v1-20260314T125823Z-3-001/PIE-Bench_v1/"
+result_dir="outputs/outputs_loop_exp/pie_bench_correctedResults_threshold_method${threshold_method}"
+output_csv="./outputs/eval_pie_bench_correctedResults_threshold_method${threshold_method}/per_case.csv"
+summary_json="./outputs/eval_pie_bench_correctedResults_threshold_method${threshold_method}/summary.json"
 
 # ── 過濾設定 ──
 # 只評估指定 category（逗號分隔），留空白代表全部

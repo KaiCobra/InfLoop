@@ -24,7 +24,7 @@ text_channels=2048
 apply_spatial_patchify=0
 
 # P2P specific parameters
-num_source_scales=4              # Number of scales to extract tokens from source
+num_source_scales=6              # Number of scales to extract tokens from source
 p2p_token_replace_prob=1       # Probability of replacing target tokens with source tokens
 p2p_token_file="./tokens_p2p.pkl"  # File to save/load extracted tokens
 
@@ -88,7 +88,7 @@ python3 tools/run_p2p.py \
 --source_prompt "${source_prompt}" \
 --target_prompt "${target_prompt}" \
 --seed 1 \
---save_file ./outputs/p2p/ \
+--save_file ./outputs/p2p_${num_source_scales}/ \
 --num_source_scales ${num_source_scales} \
 --p2p_token_replace_prob ${p2p_token_replace_prob} \
 --p2p_token_file ${p2p_token_file}
