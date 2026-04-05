@@ -1,7 +1,7 @@
 """
 自適應閾值方法模組（Adaptive Threshold Methods）
 
-提供 8 種閾值策略，用於 attention map 二值化：
+提供 13 種閾值策略，用於 attention map 二值化：
     1. 固定 percentile
     2. Dynamic threshold（ternary search + reference mask）
     3. Otsu 最大類間方差法
@@ -10,6 +10,11 @@
     6. Source Image Edge-Attention 跨頻譜相干性
     7. GMM 雙高斯混合模型
     8. 複合方案（方案 6 → Otsu → R_k fallback）
+    9. IPR 逆參與率
+    10. Shannon Entropy 有效面積估計
+    11. Block Consensus Voting
+    12. Kneedle / Elbow Detection
+    13. Meta-Adaptive（CV 變異係數 → 動態 k 倍率門檻）
 
 統一入口：
     compute_threshold(filtered_attn, method, low_attn, ...) -> (threshold, denoised_attn, info_str)
@@ -33,6 +38,7 @@ METHOD_IPR = 9
 METHOD_ENTROPY = 10
 METHOD_BLOCK_CONSENSUS = 11
 METHOD_KNEEDLE = 12
+METHOD_META_ADAPTIVE = 13
 
 METHOD_NAMES = {
     1: "Fixed Percentile",
@@ -47,6 +53,7 @@ METHOD_NAMES = {
     10: "Shannon Entropy",
     11: "Block Consensus Voting",
     12: "Kneedle (Elbow Detection)",
+    13: "Meta-Adaptive (CV→k)",
 }
 
 
@@ -909,6 +916,53 @@ def threshold_kneedle(
 
 
 # =====================================================================
+#  方法 13：Meta-Adaptive Thresholding（CV 變異係數 → 動態 k 倍率）
+# =====================================================================
+def threshold_meta_adaptive(
+    filtered_attn: np.ndarray,
+    low_attn: bool = False,
+    cv_min: float = 0.5,
+    cv_max: float = 1.5,
+    k_min: float = 1.5,
+    k_max: float = 4.5,
+    **_kwargs,
+) -> Tuple[float, np.ndarray, str]:
+    """
+    利用變異係數（CV）動態決定門檻倍率 k，再以 μ + k·σ 作為門檻。
+
+    CV 高（分散）→ k 大 → 門檻高 → mask 小（聚焦 hotspot）
+    CV 低（集中）→ k 小 → 門檻低 → mask 大
+
+    映射：CV ∈ [cv_min, cv_max] → k ∈ [k_min, k_max]（線性插值 + clamp）
+    門檻：τ = μ + k·σ
+    """
+    eps = 1e-8
+    mu = float(filtered_attn.mean())
+    sigma = float(filtered_attn.std())
+    cv = sigma / (mu + eps)
+
+    # 線性插值 CV → k
+    if cv_max - cv_min < eps:
+        k = (k_min + k_max) / 2.0
+    else:
+        k = k_min + (cv - cv_min) * (k_max - k_min) / (cv_max - cv_min)
+    k = float(np.clip(k, k_min, k_max))
+
+    tau_base = mu + k * sigma
+
+    if low_attn:
+        coverage = float((filtered_attn < tau_base).mean()) * 100
+    else:
+        coverage = float((filtered_attn >= tau_base).mean()) * 100
+
+    info = (
+        f"meta-adaptive: μ={mu:.4f}, σ={sigma:.4f}, CV={cv:.3f}, "
+        f"k={k:.2f}, τ={tau_base:.4f}, hotspot={coverage:.1f}%"
+    )
+    return tau_base, filtered_attn, info
+
+
+# =====================================================================
 #  統一入口
 # =====================================================================
 def compute_threshold(
@@ -933,7 +987,7 @@ def compute_threshold(
 
     Args:
         filtered_attn: (H, W) IQR 過濾後的 attention map（float32）
-        method: 1~12，對應 12 種閾值策略
+        method: 1~13，對應 13 種閾值策略
         low_attn: True = preserve mask（閾值以下為 True）
         percentile: 方法 1 的固定百分位數
         ref_mask: 方法 2 需要的 reference mask
@@ -997,8 +1051,11 @@ def compute_threshold(
     elif method == METHOD_KNEEDLE:
         return threshold_kneedle(filtered_attn, low_attn)
 
+    elif method == METHOD_META_ADAPTIVE:
+        return threshold_meta_adaptive(filtered_attn, low_attn)
+
     else:
         raise ValueError(
             f"未知的 threshold method: {method}。"
-            f"有效範圍：1~12，對應 {METHOD_NAMES}"
+            f"有效範圍：1~13，對應 {METHOD_NAMES}"
         )

@@ -1374,10 +1374,11 @@ def main() -> None:
                              'Phase 1.7 以 source gen token 替換前幾個 scale（0=停用）。預設：4')
     parser.add_argument('--use_normalized_attn', type=int, default=0, choices=[0, 1],
                         help='使用 z-score normalized threshold 取代固定 percentile（0=停用，1=啟用）')
-    parser.add_argument('--threshold_method', type=int, default=1, choices=list(range(1, 13)),
+    parser.add_argument('--threshold_method', type=int, default=1, choices=list(range(1, 14)),
                         help='閾值方法：1=固定percentile 2=dynamic ternary 3=Otsu 4=FFT+Otsu '
                              '5=SpectralEnergy 6=EdgeCoherence 7=GMM 8=Composite '
-                             '9=IPR 10=Entropy 11=BlockConsensus 12=Kneedle。預設：1')
+                             '9=IPR 10=Entropy 11=BlockConsensus 12=Kneedle '
+                             '13=MetaAdaptive。預設：1')
     parser.add_argument('--use_last_scale_mask', type=int, default=0, choices=[0, 1],
                         help='僅從最後一個 scale 提取 attention mask，再向前逐步推導各 scale（0=停用，1=啟用）')
     parser.add_argument('--last_scale_majority_threshold', type=float, default=0.5,

@@ -1,6 +1,6 @@
 # 自適應閾值方法文件（Adaptive Threshold Methods）
 
-本文件說明 `infinity/utils/adaptiveThreshold.py` 中實作的 **8 種閾值策略**，用於將 IQR 過濾後的 cross-attention map 二值化為 focus / preserve mask。
+本文件說明 `infinity/utils/adaptiveThreshold.py` 中實作的 **13 種閾值策略**，用於將 IQR 過濾後的 cross-attention map 二值化為 focus / preserve mask。
 
 ---
 
@@ -718,6 +718,72 @@ $$
 
 ---
 
+## 方法 13：Meta-Adaptive Thresholding（CV 變異係數 → 動態 k 倍率）
+
+**`--threshold_method 13`**
+
+### 概念
+
+直接以 attention map 的**變異係數（Coefficient of Variation, CV）**作為集中度信號，動態決定門檻倍率 $k$，再以 $\mu + k \cdot \sigma$ 作為閾值。CV 高代表 attention 相對分散（前景清晰突出），需要較高的倍率才能篩出 hotspot；CV 低代表 attention 相對均勻，使用較低倍率即可。不需要任何外部輸入，計算量 $O(N)$。
+
+### 數學公式
+
+**Step 1：統計量計算**
+
+$$
+\mu = \text{mean}(\hat{a}_k), \quad \sigma = \text{std}(\hat{a}_k), \quad CV = \frac{\sigma}{\mu + \varepsilon}
+$$
+
+**Step 2：動態門檻倍率（Adaptive k）**
+
+將 $CV$ 線性插值映射至倍率 $k$：
+
+$$
+k = \text{clamp}\!\left( k_{\min} + (CV - CV_{\min}) \cdot \frac{k_{\max} - k_{\min}}{CV_{\max} - CV_{\min}},\; k_{\min},\; k_{\max} \right)
+$$
+
+預設映射：$CV \in [0.5, 1.5] \rightarrow k \in [1.5, 4.5]$（超出範圍直接 clamp）。
+
+**Step 3：基礎門檻與熱點比例**
+
+$$
+\tau_{\text{base}} = \mu + k \cdot \sigma
+$$
+
+$$
+\rho = \frac{|\{\,i : \hat{a}_k[i] > \tau_{\text{base}}\,\}|}{N}
+$$
+
+### 直覺
+
+| 場景 | CV | k | $\tau$ | mask |
+|------|----|---|--------|------|
+| 小物件、高對比 | 高 (>1.5) | 4.5（clamp max） | 高 | 面積小 |
+| 中等物件 | 中 (~1.0) | ~3.0 | 中 | 面積適中 |
+| 大物件、低對比 | 低 (<0.5) | 1.5（clamp min） | 低 | 面積大 |
+
+### 超參數
+
+| 參數 | 預設值 | 說明 |
+|------|--------|----- |
+| `cv_min` | 0.5 | CV 映射下界 |
+| `cv_max` | 1.5 | CV 映射上界 |
+| `k_min` | 1.5 | 倍率下界（對應分散 attention）|
+| `k_max` | 4.5 | 倍率上界（對應集中 attention）|
+
+以上參數為函式預設值，無需透過 CLI 傳入。
+
+### 特性
+
+- ✅ 無需 reference mask、source image 或任何外部輸入
+- ✅ 計算 $O(N)$，僅需 mean / std 兩個統計量
+- ✅ 物理意義明確：CV 是標準化的離散度量，不受絕對值域影響
+- ✅ 直接輸出絕對值閾值 $\tau$，不經過 percentile 中間步驟
+- ❌ CV 的映射範圍 $[CV_{\min}, CV_{\max}]$ 是人工設計的先驗，需要對 attention 分佈有一定了解
+- ⚠️ 若 attention 接近全零（$\mu \approx 0$），CV 可能因 $\varepsilon$ 而被低估，導致 $k$ 偏小
+
+---
+
 ## 方法比較總覽
 
 | # | 方法 | 需 source image | 需 ref mask | 超參數 | 自適應 | 備註 |
@@ -734,6 +800,7 @@ $$
 | 10 | Shannon Entropy | ✗ | ✗ | 無 | ✔ | 熵有效面積，對長尾敏感 |
 | 11 | Block Consensus | ✗ | ✗ | 無 | ✔ | 逐 block 投票面積中位數 |
 | 12 | Kneedle | ✗ | ✗ | 無 | ✔ | 排序曲線肘部偵測 |
+| 13 | Meta-Adaptive | ✗ | ✗ | 無 | ✔ | CV 變異係數 → 動態 k·σ 門檻 |
 
 ---
 
@@ -759,7 +826,7 @@ python3 tools/batch_run_pie_edit.py \
 批量跑所有方法：
 
 ```bash
-for m in 1 2 3 4 5 6 7 8 9 10 11 12; do
+for m in 1 2 3 4 5 6 7 8 9 10 11 12 13; do
   sed -i "s/^threshold_method=.*/threshold_method=$m/" scripts/batch_run_pie_edit.sh
   bash scripts/batch_run_pie_edit.sh
 done
