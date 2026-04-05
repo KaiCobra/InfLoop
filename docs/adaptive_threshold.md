@@ -526,6 +526,198 @@ $$
 
 ---
 
+## 方法 9：IPR（Inverse Participation Ratio）自適應面積估計
+
+**`--threshold_method 9`**
+
+### 概念
+
+利用逆參與率（IPR）直接從 attention 分佈形狀估計**等效集中面積** $\hat{f}$，再一步反推最佳 percentile。小物件 attention 集中 → $\hat{f}$ 小 → percentile 高（~95%）；大物件 attention 分散 → $\hat{f}$ 大 → percentile 低（~70%）。零超參數（或一個可選的收縮係數 $\gamma$），計算量 $O(N)$。
+
+### 數學公式
+
+$$
+\hat{f} = \frac{\left(\sum_{i,j} \bar{A}(i,j)\right)^2}{N \cdot \sum_{i,j} \bar{A}(i,j)^2}
+$$
+
+其中 $N = H \times W$ 為 spatial token 總數。
+
+**直覺**：若 attention 均勻集中在 $K$ 個 pixel 上（其餘為 0），則 $\hat{f} = K/N$。
+
+反推 percentile：
+
+$$
+p = \text{clip}\bigl((1 - \gamma \cdot \hat{f}) \times 100,\; 50,\; 98\bigr)
+$$
+
+$$
+\tau = \text{Percentile}(\tilde{A}_k,\; p)
+$$
+
+### 超參數
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `shrink_gamma` | 1.0 | 收縮係數。$\gamma=1$ 為保守估計；$\gamma < 1$ 偏向更 tight 的 mask |
+
+### 特性
+
+- ✅ 一行公式，零超參數（$\gamma=1$ 時），計算 $O(N)$
+- ✅ 對小物件/大物件自然給出不同 percentile
+- ✅ 不需要 reference mask、source image 或任何外部輸入
+- ❌ 對均勻分散的 attention（無明顯前景/背景）可能給出過大的面積估計
+- ⚠️ $\hat{f}$ 是「等效面積」，通常略大於實際物件面積（邊緣有衰減）
+
+---
+
+## 方法 10：Shannon Entropy 有效面積估計
+
+**`--threshold_method 10`**
+
+### 概念
+
+與 IPR 概念類似，但用資訊熵衡量 attention 分佈的「展開程度」。Shannon 熵對長尾分佈更敏感——即使只有少量 pixel 的 attention 值偏高，也會顯著降低 entropy，從而給出更 selective 的 percentile。
+
+### 數學公式
+
+將 attention map 轉為機率分佈：
+
+$$
+p_{i,j} = \frac{\bar{A}(i,j)}{\sum_{i,j} \bar{A}(i,j)}
+$$
+
+Shannon 熵：
+
+$$
+H = -\sum_{i,j} p_{i,j} \ln p_{i,j}
+$$
+
+等效支撐大小（entropy 最大時為 $N$，最小時為 1）：
+
+$$
+N_{\text{eff}} = e^{H}
+$$
+
+$$
+\hat{f} = \frac{N_{\text{eff}}}{N}
+$$
+
+反推 percentile：
+
+$$
+p = \text{clip}\bigl((1 - \hat{f}) \times 100,\; 50,\; 98\bigr)
+$$
+
+### 超參數
+
+無。
+
+### 特性
+
+- ✅ 無超參數
+- ✅ 對長尾分佈比 IPR 更敏感（少量高值 pixel 影響較大）
+- ✅ $N_{\text{eff}}$ 有明確的資訊論意義
+- ❌ 對全局平坦 attention（均勻分佈）→ $\hat{f} \approx 1$，percentile 過低
+- ⚠️ 需要 $O(N)$ 計算 + log 運算
+
+---
+
+## 方法 11：Block Consensus Voting（逐 block Otsu 投票）
+
+**`--threshold_method 11`**
+
+### 概念
+
+IQR 之後保留了 $B$ 個 block 的 attention maps $\{A_b\}$。對每個 block **獨立**做 Otsu 二值化，得到 $B$ 個 binary masks，然後計算各 pixel 的**投票率**（多少比例的 block 認為該位置是 focus）。以面積中位數估計物件大小，反推 percentile。
+
+此方法充分利用了「平均之前」的多 block 資訊，而非只看平均後的結果。
+
+### 數學公式
+
+**Step 1：逐 block Otsu 二值化**
+
+$$
+M_b(i,j) = \bigl[A_b(i,j) \geq \tau_b^{\text{Otsu}}\bigr], \quad b = 1, \ldots, B
+$$
+
+**Step 2：投票率**
+
+$$
+V(i,j) = \frac{1}{B} \sum_{b=1}^{B} M_b(i,j) \in [0, 1]
+$$
+
+**Step 3：面積中位數**
+
+$$
+f_b = \frac{|M_b|}{N}, \quad \hat{f} = \text{median}(f_1, f_2, \ldots, f_B)
+$$
+
+反推 percentile：
+
+$$
+p = \text{clip}\bigl((1 - \hat{f}) \times 100,\; 50,\; 98\bigr)
+$$
+
+### 超參數
+
+無外部超參數。
+
+### Fallback 條件
+
+- `attn_stack` 不可用（`None` 或 block 數 < 2）→ fallback 到方法 9（IPR）
+
+### 特性
+
+- ✅ 充分利用 IQR 後多 block 的分歧資訊
+- ✅ 面積中位數比平均值更穩健（不受少數極端 block 影響）
+- ✅ 無外部超參數
+- ❌ 需要 `attn_stack`（IQR 過濾後的 per-block maps），需 pipeline 額外傳遞
+- ❌ 計算量略高：$O(B \times N)$（B 約 20-30，實際可忽略）
+
+---
+
+## 方法 12：Kneedle / Elbow Detection（排序曲線最大離差點）
+
+**`--threshold_method 12`**
+
+### 概念
+
+將 $\bar{A}$ 展平並降序排列，正規化為 $[0, 1]$ 曲線，找到距離對角線 $(0,1) \to (1,0)$ 最遠的「肘部」位置——左側為 focus 區域，右側為背景。
+
+### 數學公式
+
+排序：$a_1 \geq a_2 \geq \cdots \geq a_N$
+
+正規化：
+
+$$
+x_i = \frac{i}{N}, \quad y_i = \frac{a_i - a_N}{a_1 - a_N}
+$$
+
+找最大離差點（距離對角線 $y = 1 - x$ 最遠處）：
+
+$$
+k^* = \arg\max_i \; |y_i - (1 - x_i)|
+$$
+
+$$
+\hat{f} = \frac{k^*}{N}, \quad \tau = a_{k^*}
+$$
+
+### 超參數
+
+無。
+
+### 特性
+
+- ✅ 無超參數，幾何直覺清晰
+- ✅ 直接輸出閾值（不需要經過 percentile 中間步驟）
+- ✅ 對多峰/非高斯分佈同樣有效
+- ❌ 假設降序曲線呈凹形（注意力有明顯的前景/背景分離）
+- ❌ 對非常平坦的注意力分佈可能過度敏感
+
+---
+
 ## 方法比較總覽
 
 | # | 方法 | 需 source image | 需 ref mask | 超參數 | 自適應 | 備註 |
@@ -538,6 +730,10 @@ $$
 | 6 | Edge Coherence | ✔ | ✗ | 無 | ✔ | 頻率域相位濾波 |
 | 7 | GMM | ✗ | ✗ | 無 | ✔ | EM 雙高斯混合模型 |
 | 8 | Composite | 可選 | ✗ | `R_min`, `cutoff_ratio` | ✔ | 6→3→5 複合策略 |
+| 9 | IPR | ✗ | ✗ | `shrink_gamma` | ✔ | 逆參與率面積估計，推薦 |
+| 10 | Shannon Entropy | ✗ | ✗ | 無 | ✔ | 熵有效面積，對長尾敏感 |
+| 11 | Block Consensus | ✗ | ✗ | 無 | ✔ | 逐 block 投票面積中位數 |
+| 12 | Kneedle | ✗ | ✗ | 無 | ✔ | 排序曲線肘部偵測 |
 
 ---
 
@@ -563,7 +759,7 @@ python3 tools/batch_run_pie_edit.py \
 批量跑所有方法：
 
 ```bash
-for m in 1 2 3 4 5 6 7 8; do
+for m in 1 2 3 4 5 6 7 8 9 10 11 12; do
   sed -i "s/^threshold_method=.*/threshold_method=$m/" scripts/batch_run_pie_edit.sh
   bash scripts/batch_run_pie_edit.sh
 done

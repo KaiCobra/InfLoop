@@ -29,6 +29,10 @@ METHOD_SPECTRAL_ENERGY = 5
 METHOD_EDGE_COHERENCE = 6
 METHOD_GMM = 7
 METHOD_COMPOSITE = 8
+METHOD_IPR = 9
+METHOD_ENTROPY = 10
+METHOD_BLOCK_CONSENSUS = 11
+METHOD_KNEEDLE = 12
 
 METHOD_NAMES = {
     1: "Fixed Percentile",
@@ -39,6 +43,10 @@ METHOD_NAMES = {
     6: "Edge-Attention Coherence",
     7: "GMM (2-component)",
     8: "Composite (Edge+Otsu+R_k)",
+    9: "IPR (Inverse Participation Ratio)",
+    10: "Shannon Entropy",
+    11: "Block Consensus Voting",
+    12: "Kneedle (Elbow Detection)",
 }
 
 
@@ -679,6 +687,228 @@ def threshold_composite(
 
 
 # =====================================================================
+#  方法 9：IPR（Inverse Participation Ratio）自適應面積估計
+# =====================================================================
+def threshold_ipr(
+    filtered_attn: np.ndarray,
+    low_attn: bool = False,
+    shrink_gamma: float = 1.0,
+    **_kwargs,
+) -> Tuple[float, np.ndarray, str]:
+    """
+    利用逆參與率（IPR）估計 attention 的等效集中面積，再反推 percentile。
+
+    f_hat = (sum A)^2 / (N * sum A^2)
+    percentile = clip(1 - gamma * f_hat, 0.50, 0.98) * 100
+
+    小物件 → f_hat 小 → percentile 高（~95）；大物件 → f_hat 大 → percentile 低（~70）。
+
+    Args:
+        shrink_gamma: 收縮係數（預設 1.0 = 不收縮；<1 偏向更 tight 的 mask）
+    """
+    sum_A = float(filtered_attn.sum())
+    sum_A2 = float((filtered_attn ** 2).sum())
+    N = filtered_attn.size
+
+    if sum_A2 < 1e-15:
+        # 全零 attention
+        pct = 75.0
+        f_hat = 0.0
+    else:
+        f_hat = (sum_A ** 2) / (N * sum_A2)
+        pct = float(np.clip((1.0 - shrink_gamma * f_hat) * 100.0, 50.0, 98.0))
+
+    if low_attn:
+        thr = float(np.percentile(filtered_attn, 100.0 - pct))
+        coverage = float((filtered_attn < thr).mean()) * 100
+    else:
+        thr = float(np.percentile(filtered_attn, pct))
+        coverage = float((filtered_attn >= thr).mean()) * 100
+
+    info = (
+        f"ipr: f̂={f_hat:.4f}, γ={shrink_gamma:.2f}, pct={pct:.1f}, "
+        f"thr={thr:.4f}, coverage={coverage:.1f}%"
+    )
+    return thr, filtered_attn, info
+
+
+# =====================================================================
+#  方法 10：Shannon Entropy 有效面積估計
+# =====================================================================
+def threshold_entropy(
+    filtered_attn: np.ndarray,
+    low_attn: bool = False,
+    **_kwargs,
+) -> Tuple[float, np.ndarray, str]:
+    """
+    用 Shannon 熵估計 attention 的等效展開面積。
+
+    p_ij = A_ij / sum(A)
+    H = -sum(p * ln(p))
+    N_eff = exp(H)
+    f_hat = N_eff / N
+    percentile = clip(1 - f_hat, 0.50, 0.98) * 100
+    """
+    N = filtered_attn.size
+    sum_A = float(filtered_attn.sum())
+
+    if sum_A < 1e-15:
+        pct = 75.0
+        f_hat = 0.0
+        N_eff = 0.0
+    else:
+        p = filtered_attn.ravel().astype(np.float64) / sum_A
+        # 避免 log(0)
+        p_safe = p[p > 1e-30]
+        H = -float(np.sum(p_safe * np.log(p_safe)))
+        N_eff = float(np.exp(H))
+        f_hat = N_eff / N
+        pct = float(np.clip((1.0 - f_hat) * 100.0, 50.0, 98.0))
+
+    if low_attn:
+        thr = float(np.percentile(filtered_attn, 100.0 - pct))
+        coverage = float((filtered_attn < thr).mean()) * 100
+    else:
+        thr = float(np.percentile(filtered_attn, pct))
+        coverage = float((filtered_attn >= thr).mean()) * 100
+
+    info = (
+        f"entropy: N_eff={N_eff:.1f}, f̂={f_hat:.4f}, pct={pct:.1f}, "
+        f"thr={thr:.4f}, coverage={coverage:.1f}%"
+    )
+    return thr, filtered_attn, info
+
+
+# =====================================================================
+#  方法 11：Block Consensus Voting（逐 block Otsu 投票）
+# =====================================================================
+def threshold_block_consensus(
+    filtered_attn: np.ndarray,
+    low_attn: bool = False,
+    attn_stack: Optional[np.ndarray] = None,
+    **_kwargs,
+) -> Tuple[float, np.ndarray, str]:
+    """
+    對 IQR 過濾後保留的每個 block 獨立做 Otsu 二值化，
+    計算投票率 V(i,j)（多少比例 block 認為該位置是 focus），
+    以面積中位數估計物件大小，反推 percentile。
+
+    若無 attn_stack（fallback），退化為對 filtered_attn 做 IPR。
+
+    Args:
+        attn_stack: (B, H, W) ndarray — IQR 過濾後保留的各 block attention maps
+    """
+    N = filtered_attn.size
+
+    if attn_stack is None or len(attn_stack) < 2:
+        # fallback 到 IPR
+        thr, attn_out, info = threshold_ipr(filtered_attn, low_attn)
+        return thr, attn_out, f"block_consensus fallback (no stack) → {info}"
+
+    B = attn_stack.shape[0]
+    block_masks = []
+    block_areas = []
+
+    for b in range(B):
+        a_b = attn_stack[b]
+        a_min, a_max = float(a_b.min()), float(a_b.max())
+        if a_max - a_min < 1e-10:
+            # 均勻值 → 全 False
+            m_b = np.zeros_like(a_b, dtype=bool)
+        else:
+            normed = ((a_b - a_min) / (a_max - a_min) * 255).astype(np.uint8)
+            otsu_val, _ = cv2.threshold(normed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            otsu_thr = a_min + (otsu_val / 255.0) * (a_max - a_min)
+            m_b = a_b >= otsu_thr
+        block_masks.append(m_b)
+        block_areas.append(float(m_b.mean()))
+
+    # 投票率 V(i,j)
+    vote_map = np.mean(np.stack(block_masks, axis=0).astype(np.float32), axis=0)  # (H, W)
+
+    # 面積中位數
+    f_median = float(np.median(block_areas))
+    f_hat = float(np.clip(f_median, 0.01, 0.99))
+    pct = float(np.clip((1.0 - f_hat) * 100.0, 50.0, 98.0))
+
+    if low_attn:
+        thr = float(np.percentile(filtered_attn, 100.0 - pct))
+        coverage = float((filtered_attn < thr).mean()) * 100
+    else:
+        thr = float(np.percentile(filtered_attn, pct))
+        coverage = float((filtered_attn >= thr).mean()) * 100
+
+    areas_str = ", ".join(f"{a:.2f}" for a in block_areas[:5])
+    if B > 5:
+        areas_str += f"... ({B} blocks)"
+    info = (
+        f"block_consensus: B={B}, areas=[{areas_str}], "
+        f"f̂_med={f_hat:.4f}, pct={pct:.1f}, thr={thr:.4f}, coverage={coverage:.1f}%"
+    )
+    return thr, filtered_attn, info
+
+
+# =====================================================================
+#  方法 12：Kneedle / Elbow Detection（排序曲線最大離差點）
+# =====================================================================
+def threshold_kneedle(
+    filtered_attn: np.ndarray,
+    low_attn: bool = False,
+    **_kwargs,
+) -> Tuple[float, np.ndarray, str]:
+    """
+    將 attention 值降序排列，正規化為 [0,1] 曲線，
+    找到距離對角線 (0,1)→(1,0) 最遠的「肘部」位置作為閾值。
+
+    x_i = i/N,  y_i = (a_i - a_N) / (a_1 - a_N)
+    k* = argmax |y_i - (1 - x_i)|
+    f_hat = k* / N
+    """
+    vals = np.sort(filtered_attn.ravel())[::-1]  # 降序
+    N = len(vals)
+
+    if N < 2 or vals[0] - vals[-1] < 1e-10:
+        # 全部相同值
+        pct = 75.0
+        f_hat = 0.25
+        thr = float(np.percentile(filtered_attn, pct))
+        info = f"kneedle: uniform attn, fallback pct={pct:.0f}"
+        if low_attn:
+            thr = float(np.percentile(filtered_attn, 100.0 - pct))
+            coverage = float((filtered_attn < thr).mean()) * 100
+        else:
+            coverage = float((filtered_attn >= thr).mean()) * 100
+        info += f", thr={thr:.4f}, coverage={coverage:.1f}%"
+        return thr, filtered_attn, info
+
+    # 正規化
+    x = np.arange(N, dtype=np.float64) / N
+    y = (vals - vals[-1]) / (vals[0] - vals[-1])
+
+    # 距離對角線 y = 1 - x 的偏差
+    deviation = np.abs(y - (1.0 - x))
+    k_star = int(np.argmax(deviation))
+
+    f_hat = float(k_star) / N
+    pct = float(np.clip((1.0 - f_hat) * 100.0, 50.0, 98.0))
+    thr_val = float(vals[k_star])
+
+    if low_attn:
+        # 對 low_attn 仍用 percentile 確保一致性
+        thr = float(np.percentile(filtered_attn, 100.0 - pct))
+        coverage = float((filtered_attn < thr).mean()) * 100
+    else:
+        thr = thr_val
+        coverage = float((filtered_attn >= thr).mean()) * 100
+
+    info = (
+        f"kneedle: k*={k_star}/{N}, f̂={f_hat:.4f}, pct={pct:.1f}, "
+        f"thr={thr:.4f}, coverage={coverage:.1f}%"
+    )
+    return thr, filtered_attn, info
+
+
+# =====================================================================
 #  統一入口
 # =====================================================================
 def compute_threshold(
@@ -695,13 +925,15 @@ def compute_threshold(
     percentile_max: float = 90.0,
     cutoff_ratio: float = 0.25,
     R_min: float = 0.3,
+    shrink_gamma: float = 1.0,
+    attn_stack: Optional[np.ndarray] = None,
 ) -> Tuple[float, np.ndarray, str]:
     """
     統一閾值計算入口。
 
     Args:
         filtered_attn: (H, W) IQR 過濾後的 attention map（float32）
-        method: 1~8，對應 8 種閾值策略
+        method: 1~12，對應 12 種閾值策略
         low_attn: True = preserve mask（閾值以下為 True）
         percentile: 方法 1 的固定百分位數
         ref_mask: 方法 2 需要的 reference mask
@@ -713,6 +945,8 @@ def compute_threshold(
         percentile_max: 方法 5 的最高百分位
         cutoff_ratio: 方法 5/8 的頻率截止比
         R_min: 方法 8 的最低頻譜能量比
+        shrink_gamma: 方法 9 的 IPR 收縮係數（預設 1.0）
+        attn_stack: (B, H, W) 方法 11 需要的 IQR 過濾後各 block attention maps
 
     Returns:
         (threshold, processed_attn, info_str)
@@ -751,8 +985,20 @@ def compute_threshold(
             R_min, fallback_percentile, cutoff_ratio
         )
 
+    elif method == METHOD_IPR:
+        return threshold_ipr(filtered_attn, low_attn, shrink_gamma)
+
+    elif method == METHOD_ENTROPY:
+        return threshold_entropy(filtered_attn, low_attn)
+
+    elif method == METHOD_BLOCK_CONSENSUS:
+        return threshold_block_consensus(filtered_attn, low_attn, attn_stack)
+
+    elif method == METHOD_KNEEDLE:
+        return threshold_kneedle(filtered_attn, low_attn)
+
     else:
         raise ValueError(
             f"未知的 threshold method: {method}。"
-            f"有效範圍：1~8，對應 {METHOD_NAMES}"
+            f"有效範圍：1~12，對應 {METHOD_NAMES}"
         )

@@ -46,7 +46,7 @@ use_last_scale_mask=0
 last_scale_majority_threshold=0.45
 seed=1
 
-# 閾值方法（1~8）
+# 閾值方法（1~12）
 # 1 = 固定 percentile
 # 2 = Dynamic threshold（ternary search + reference mask，需搭配 PIE-Bench）
 # 3 = Otsu 最大類間方差法（無超參數）
@@ -55,6 +55,10 @@ seed=1
 # 6 = Source Image Edge-Attention 跨頻譜相干性（需 source_image）
 # 7 = GMM 雙高斯混合模型
 # 8 = 複合方案（Edge-Coherent → Otsu → R_k fallback）
+# 9 = IPR 逆參與率（等效面積估計 → 自適應 percentile）
+# 10 = Shannon Entropy 有效面積估計
+# 11 = Block Consensus Voting（逐 block Otsu 投票 → 面積中位數）
+# 12 = Kneedle / Elbow Detection（排序曲線最大離差點）
 threshold_method=1
 
 # Single-focus fallback（只有 target focus，無 source focus）時，

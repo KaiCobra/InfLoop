@@ -77,7 +77,7 @@ inject_weights="0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0"
 
 # ── Attention 遮罩參數 ──
 
-# 閾值方法（1~8）
+# 閾值方法（1~12）
 # 1 = 固定 percentile
 # 2 = Dynamic threshold（ternary search + reference mask，需搭配 PIE-Bench）
 # 3 = Otsu 最大類間方差法（無超參數）
@@ -86,6 +86,10 @@ inject_weights="0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0 0.0"
 # 6 = Source Image Edge-Attention 跨頻譜相干性（需 source_image）
 # 7 = GMM 雙高斯混合模型
 # 8 = 複合方案（Edge-Coherent → Otsu → R_k fallback）
+# 9 = IPR 逆參與率（等效面積估計 → 自適應 percentile）
+# 10 = Shannon Entropy 有效面積估計
+# 11 = Block Consensus Voting（逐 block Otsu 投票 → 面積中位數）
+# 12 = Kneedle / Elbow Detection（排序曲線最大離差點）
 threshold_method=3
 
 # 前幾個 scale 做 100% source token 替換（p2p 模式時才生效）
