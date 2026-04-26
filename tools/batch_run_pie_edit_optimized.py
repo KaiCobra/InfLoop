@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-run_pie_edit.py — PIE-Bench 批量 P2P-Edit 評估腳本
+batch_run_pie_edit_optimized.py — PIE-Bench 批量 P2P-Edit（速度最佳化版，自包含）
 
-功能：
-  • 載入模型一次，批量處理 PIE-Bench 資料集的 700 個測試案例
-  • 依照原始資料夾結構輸出結果（{output_dir}/{category}/{case_id}/）
-  • 每個案例輸出：source.jpg、target.jpg（可選：attn_masks/）
+最佳化項目（相對於 run_pie_edit.py）：
+  1. VAE 編碼合併：encode_image_to_features_and_tokens() 一次 forward 同時取得
+     raw_features（連續注入用）與 scale_tokens（P2P token 替換用），省一次 encoder pass。
+  2. Phase 1 / Phase 1.7 關閉 CFG：中間生成 pass 使用 cfg=1.0，
+     模型 batch 從 2×B 降回 B，節省約一半計算量（Phase 2 最終輸出仍使用 args.cfg）。
+  3. BitwiseTokenStorage 移至 CUDA：tokens 與 masks 在 Phase 2 前統一搬移到 GPU，
+     避免 autoregressive_infer_cfg 內每個 scale 的 H2D transfer。
+
+批量格式支援：
+  A) PIE-Bench_v1 官方格式（--bench_dir 指向含 mapping_file.json 的目錄）
+  B) extracted_pie_bench 扁平格式（<bench_dir>/<category>/<task_id>/meta.json）
 
 使用方式：
-  bash scripts/pie_edit.sh
+  bash scripts/batch_run_pie_edit_optimized.sh
   或
-  python3 tools/run_pie_edit.py --bench_dir <path> --output_dir <path> [options]
+  python3 tools/batch_run_pie_edit_optimized.py --bench_dir <path> --output_dir <path> [options]
 """
 
+import contextlib
+import datetime
 import os
 import re
 import sys
@@ -22,6 +31,7 @@ import time
 import argparse
 import difflib
 import traceback
+from collections import defaultdict
 from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -30,6 +40,7 @@ import numpy as np
 import torch
 from torch.cuda.amp import autocast
 from PIL import Image
+import PIL.Image as PImage
 
 # ── 確保工作目錄在 sys.path 中 ──
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -50,8 +61,8 @@ from tools.run_p2p_edit import (
     _save_prob_masks_to_dir,
     _save_masks_to_dir,
     gen_one_img,
-    encode_image_to_raw_features,
-    encode_image_to_scale_tokens,
+    encode_image_to_raw_features,   # kept for compatibility
+    encode_image_to_scale_tokens,   # kept for compatibility
     load_tokenizer,
     load_visual_tokenizer,
     load_transformer,
@@ -60,6 +71,86 @@ from tools.run_p2p_edit import (
 from infinity.utils.bitwise_token_storage import BitwiseTokenStorage
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w
 from attention_map.extractor import CrossAttentionExtractor, AttentionCacheInjector
+
+
+# ============================================================
+# 最佳化輔助函式（optimized helpers）
+# ============================================================
+
+def encode_image_to_features_and_tokens(
+    vae,
+    pil_img: PImage.Image,
+    scale_schedule: List[Tuple[int, int, int]],
+    device: torch.device,
+    apply_spatial_patchify: bool = False,
+    token_device: str = 'cuda',
+) -> Tuple[torch.Tensor, Dict[int, torch.Tensor]]:
+    """
+    【最佳化版】一次 VAE encoder forward pass 同時取得 raw_features 與 scale_tokens。
+
+    原本 encode_image_to_raw_features() + encode_image_to_scale_tokens() 會分別呼叫
+    vae.encode_for_raw_features() 和 vae.encode()，後者內部又再跑一次 encoder。
+    此函式改為單次 vae.encode() — encoder 只跑一次，節省一次完整的 encoder forward。
+
+    Returns:
+        raw_features  : Tensor[1, d, 1, H_full, W_full]  — 連續 VAE encoder 輸出 (bfloat16)
+        scale_tokens  : Dict[si -> Tensor[1, 1, h_si, w_si, d_vae]] — 各 scale 的 bit indices
+                        存放於 token_device（預設 'cuda'，避免 Phase 2 的 H2D transfer）
+    """
+    if apply_spatial_patchify:
+        vae_scale_schedule = [(t, h * 2, w * 2) for (t, h, w) in scale_schedule]
+    else:
+        vae_scale_schedule = scale_schedule
+
+    _, h_final_vae, w_final_vae = vae_scale_schedule[-1]
+    patch_size = 8 if apply_spatial_patchify else 16
+    h_img = h_final_vae * patch_size
+    w_img = w_final_vae * patch_size
+
+    img_rgb = pil_img.convert('RGB')
+    img_rgb = img_rgb.resize((w_img, h_img), resample=PImage.LANCZOS)
+
+    img_t = torch.from_numpy(np.array(img_rgb)).permute(2, 0, 1).float() / 255.0
+    img_t = img_t * 2.0 - 1.0
+    img_t = img_t.unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        with torch.amp.autocast('cuda', enabled=True, dtype=torch.bfloat16, cache_enabled=True):
+            # 單次 vae.encode() 同時取得連續 encoder 輸出 h 與量化 bit indices
+            h, _, _, all_bit_indices, _, _ = vae.encode(
+                img_t, scale_schedule=vae_scale_schedule
+            )
+
+    # raw_features: [1, d, 1, H_full, W_full]
+    raw_features = h.unsqueeze(2).detach()
+
+    # scale_tokens: 各 scale bit indices 存於 token_device
+    scale_tokens: Dict[int, torch.Tensor] = {}
+    for si, bit_idx in enumerate(all_bit_indices):
+        scale_tokens[si] = bit_idx.long().to(token_device)
+
+    print(
+        f"[encode_image_to_features_and_tokens] raw_features={tuple(raw_features.shape)}, "
+        f"dtype={raw_features.dtype}, range=[{float(raw_features.min()):.3f}, {float(raw_features.max()):.3f}]"
+    )
+    print(
+        f"[encode_image_to_features_and_tokens] scale_tokens={len(scale_tokens)} scales, "
+        f"scale 0: shape={tuple(scale_tokens[0].shape)}, device={scale_tokens[0].device}"
+    )
+    return raw_features, scale_tokens
+
+
+def _move_storage_to_device(storage: BitwiseTokenStorage, device: torch.device) -> None:
+    """
+    將 BitwiseTokenStorage 內所有 tokens / masks 原地搬移到指定 device。
+
+    在 autoregressive_infer_cfg 每個 scale 的 load_tokens() / load_mask() 呼叫前統一搬移，
+    可消除原本每個 scale 的 .to(device) H2D transfer。
+    """
+    for si in list(storage.tokens.keys()):
+        storage.tokens[si] = storage.tokens[si].to(device, non_blocking=True)
+    for si in list(storage.masks.keys()):
+        storage.masks[si] = storage.masks[si].to(device, non_blocking=True)
 
 
 # ============================================================
@@ -605,20 +696,18 @@ def run_one_case(
     source_pil_img = Image.open(source_image_path).convert('RGB')
     source_image_np_for_threshold = np.array(source_pil_img)  # (H, W, 3) uint8
 
-    image_raw_features = encode_image_to_raw_features(
+    # 【最佳化】單次 VAE encoder forward 同時取得 raw_features + scale_tokens。
+    image_raw_features, image_scale_tokens = encode_image_to_features_and_tokens(
         vae=vae,
         pil_img=source_pil_img,
         scale_schedule=scale_schedule,
         device=device_cuda,
         apply_spatial_patchify=bool(args.apply_spatial_patchify),
+        token_device='cuda' if device_cuda.type == 'cuda' else 'cpu',
     )
-    image_scale_tokens = encode_image_to_scale_tokens(
-        vae=vae,
-        pil_img=source_pil_img,
-        scale_schedule=scale_schedule,
-        device=device_cuda,
-        apply_spatial_patchify=bool(args.apply_spatial_patchify),
-    )
+
+    # 【最佳化】Phase 1 / Phase 1.7 用 cfg=1.0，batch 從 2B 降回 B。
+    _cfg_uncond = [1.0] * total_scales
 
     # 建立 inject_schedule
     if args.inject_weights.strip():
@@ -698,7 +787,8 @@ def run_one_case(
                 source_prompt,
                 g_seed=args.seed,
                 gt_leak=0, gt_ls_Bl=None,
-                cfg_list=args.cfg, tau_list=args.tau,
+                # 【最佳化】Phase 1 不需要 CFG 品質，cfg=1.0 讓 batch 維持 B。
+                cfg_list=_cfg_uncond, tau_list=args.tau,
                 scale_schedule=scale_schedule,
                 cfg_insertion_layer=[args.cfg_insertion_layer],
                 vae_type=args.vae_type,
@@ -802,8 +892,6 @@ def run_one_case(
                 use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
                 threshold_method=threshold_method,
                 source_image_np=source_image_np_for_threshold,
-                absolute_high=float(getattr(args, 'absolute_high', 0.7)),
-                absolute_low=float(getattr(args, 'absolute_low', 0.3)),
             )
             if use_last_scale:
                 _collect_kwargs["start_scale"] = args.num_full_replace_scales
@@ -823,8 +911,6 @@ def run_one_case(
                 use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
                 threshold_method=threshold_method,
                 source_image_np=source_image_np_for_threshold,
-                absolute_high=float(getattr(args, 'absolute_high', 0.7)),
-                absolute_low=float(getattr(args, 'absolute_low', 0.3)),
             )
             if use_last_scale:
                 _collect_kwargs_low["start_scale"] = args.num_full_replace_scales
@@ -909,6 +995,10 @@ def run_one_case(
             )
             phase17_injector.register_patches()
 
+        # 【最佳化】phase17_storage 移至 CUDA，消除每 scale 的 H2D transfer。
+        if phase17_storage is not None:
+            _move_storage_to_device(phase17_storage, device_cuda)
+
         with autocast(dtype=torch.bfloat16):
             with torch.no_grad():
                 _phase17_img = gen_one_img(
@@ -916,7 +1006,8 @@ def run_one_case(
                     target_prompt,
                     g_seed=args.seed,
                     gt_leak=0, gt_ls_Bl=None,
-                    cfg_list=args.cfg, tau_list=args.tau,
+                    # 【最佳化】Phase 1.7 中間 guided gen，cfg=1.0 讓 batch 維持 B。
+                    cfg_list=_cfg_uncond, tau_list=args.tau,
                     scale_schedule=scale_schedule,
                     cfg_insertion_layer=[args.cfg_insertion_layer],
                     vae_type=args.vae_type,
@@ -971,8 +1062,6 @@ def run_one_case(
                     use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
                     threshold_method=threshold_method,
                     source_image_np=source_image_np_for_threshold,
-                    absolute_high=float(getattr(args, 'absolute_high', 0.7)),
-                    absolute_low=float(getattr(args, 'absolute_low', 0.3)),
                 )
                 if use_last_scale:
                     _tgt_kwargs["start_scale"] = args.num_full_replace_scales
@@ -1019,7 +1108,8 @@ def run_one_case(
                     target_prompt,
                     g_seed=args.seed,
                     gt_leak=0, gt_ls_Bl=None,
-                    cfg_list=args.cfg, tau_list=args.tau,
+                    # 【最佳化】single-focus fallback Phase 1.7 同樣無需 CFG。
+                    cfg_list=_cfg_uncond, tau_list=args.tau,
                     scale_schedule=scale_schedule,
                     cfg_insertion_layer=[args.cfg_insertion_layer],
                     vae_type=args.vae_type,
@@ -1068,8 +1158,6 @@ def run_one_case(
                 use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
                 threshold_method=threshold_method,
                 source_image_np=source_image_np_for_threshold,
-                absolute_high=float(getattr(args, 'absolute_high', 0.7)),
-                absolute_low=float(getattr(args, 'absolute_low', 0.3)),
             )
             if use_last_scale:
                 _fb_kwargs["start_scale"] = args.num_full_replace_scales
@@ -1220,6 +1308,10 @@ def run_one_case(
     # ─────────────────────────────────────
     # Phase 2：Target 生成
     # ─────────────────────────────────────
+    # 【最佳化】p2p_token_storage 統一移至 CUDA，消除每 scale 的 H2D transfer。
+    if device_cuda.type == 'cuda':
+        _move_storage_to_device(p2p_token_storage, device_cuda)
+
     has_mask = len(p2p_token_storage.masks) > 0
     phase2_attn_cache_blended = (
         attn_cache_enabled and not use_full_p2p
@@ -1293,6 +1385,71 @@ def run_one_case(
     torch.cuda.empty_cache()
 
     return True
+
+
+# ============================================================
+# Batch helper utilities
+# ============================================================
+
+def collect_mask_stats(mask_path: str) -> dict:
+    """讀取 mask.png（若存在）並回傳白/黑比例。"""
+    stats = {
+        "mask_path": mask_path,
+        "mask_exists": False,
+        "white_ratio": None,
+        "black_ratio": None,
+        "white_percent": None,
+        "black_percent": None,
+    }
+    if not os.path.exists(mask_path):
+        return stats
+    try:
+        mask = np.array(Image.open(mask_path).convert("L"))
+        white_ratio = float((mask >= 128).mean())
+        black_ratio = float(1.0 - white_ratio)
+        stats.update({
+            "mask_exists": True,
+            "white_ratio": round(white_ratio, 6),
+            "black_ratio": round(black_ratio, 6),
+            "white_percent": round(white_ratio * 100.0, 3),
+            "black_percent": round(black_ratio * 100.0, 3),
+        })
+    except Exception as exc:
+        stats["mask_error"] = str(exc)
+    return stats
+
+
+class TeeStream:
+    """同時寫入終端與檔案，方便保存每個 case 的 print log。"""
+
+    def __init__(self, stream, file_obj):
+        self.stream = stream
+        self.file_obj = file_obj
+
+    def write(self, data):
+        ret = self.stream.write(data)
+        self.file_obj.write(data)
+        return ret
+
+    def flush(self):
+        self.stream.flush()
+        self.file_obj.flush()
+
+    def isatty(self):
+        return bool(getattr(self.stream, "isatty", lambda: False)())
+
+    def fileno(self):
+        return self.stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
+def write_task_info(save_dir: str, payload: dict) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    info_path = os.path.join(save_dir, "task_info.json")
+    with open(info_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
 # ============================================================
@@ -1382,21 +1539,21 @@ def main() -> None:
                              'Phase 1.7 以 source gen token 替換前幾個 scale（0=停用）。預設：4')
     parser.add_argument('--use_normalized_attn', type=int, default=0, choices=[0, 1],
                         help='使用 z-score normalized threshold 取代固定 percentile（0=停用，1=啟用）')
-    parser.add_argument('--threshold_method', type=int, default=1, choices=list(range(1, 15)),
+    parser.add_argument('--threshold_method', type=int, default=1, choices=list(range(1, 14)),
                         help='閾值方法：1=固定percentile 2=dynamic ternary 3=Otsu 4=FFT+Otsu '
                              '5=SpectralEnergy 6=EdgeCoherence 7=GMM 8=Composite '
                              '9=IPR 10=Entropy 11=BlockConsensus 12=Kneedle '
-                             '13=MetaAdaptive 14=Absolute(norm>high/<low)。預設：1')
-    parser.add_argument('--absolute_high', type=float, default=0.7,
-                        help='Method 14 focus 閾值（正規化後 >= absolute_high 為 focus）。預設：0.7')
-    parser.add_argument('--absolute_low', type=float, default=0.3,
-                        help='Method 14 preserve 閾值（正規化後 < absolute_low 為 preserve）。預設：0.3')
+                             '13=MetaAdaptive。預設：1')
     parser.add_argument('--use_last_scale_mask', type=int, default=0, choices=[0, 1],
                         help='僅從最後一個 scale 提取 attention mask，再向前逐步推導各 scale（0=停用，1=啟用）')
     parser.add_argument('--last_scale_majority_threshold', type=float, default=0.5,
                         help='Last-scale mask 向前推導時的多數投票閾值（預設 0.5 = 50%%）')
     parser.add_argument('--debug_mode', type=int, default=0, choices=[0, 1],
                         help='1=儲存所有中間過程圖片（phase17_guided.jpg、phase17_fallback.jpg）。預設：0')
+    parser.add_argument('--use_dynamic_threshold', type=int, default=0, choices=[0, 1],
+                        help='使用 reference mask 引導的二分法搜尋 attention threshold（0=停用，1=啟用）')
+    parser.add_argument('--dynamic_threshold_iters', type=int, default=20,
+                        help='二分法最大迭代次數（預設 20）')
 
     args = parser.parse_args()
     # 檢查模式：必須有 bench_dir 或 source_image
@@ -1516,141 +1673,284 @@ def main() -> None:
     # ══════════════════════════════════════════════════════
     # 批量模式
     # ══════════════════════════════════════════════════════
-    # ── 決定要跑的 categories ──
+
+    # ── 偵測資料集格式 ──
+    mapping_file   = os.path.join(args.bench_dir, "mapping_file.json")
+    annotation_dir = os.path.join(args.bench_dir, "annotation_images")
+    use_v1_format  = os.path.exists(mapping_file) and os.path.isdir(annotation_dir)
+
     if args.categories.strip():
-        cat_names = [c.strip() for c in args.categories.split(',') if c.strip()]
+        cat_names_filter: Optional[List[str]] = [c.strip() for c in args.categories.split(',') if c.strip()]
     else:
-        cat_names = sorted(
-            d for d in os.listdir(args.bench_dir)
-            if os.path.isdir(os.path.join(args.bench_dir, d))
-        )
+        cat_names_filter = None
+
+    if use_v1_format:
+        print(f'[Dataset] PIE-Bench_v1 格式（mapping_file.json）')
+        with open(mapping_file, 'r', encoding='utf-8') as f:
+            mapping = json.load(f)
+
+        tasks_by_cat: dict = defaultdict(list)
+        for task_id, info in mapping.items():
+            img_rel  = info.get('image_path', '')
+            category = img_rel.split('/')[0] if '/' in img_rel else 'unknown'
+            img_abs  = os.path.join(annotation_dir, img_rel)
+            tasks_by_cat[category].append({
+                'task_id':             task_id,
+                'image_path':          img_abs,
+                'original_prompt':     info.get('original_prompt', ''),
+                'editing_prompt':      info.get('editing_prompt', ''),
+                'editing_instruction': info.get('editing_instruction', ''),
+                'editing_type_id':     info.get('editing_type_id', ''),
+                'blended_word':        info.get('blended_word', ''),
+                'mask':                info.get('mask', []),
+            })
+        for cat in tasks_by_cat:
+            tasks_by_cat[cat].sort(key=lambda t: t['task_id'])
+
+        if cat_names_filter is None:
+            cat_names = sorted(tasks_by_cat.keys())
+        else:
+            cat_names = [c for c in cat_names_filter if c in tasks_by_cat]
+    else:
+        print(f'[Dataset] extracted_pie_bench 格式（per-task meta.json）')
+        tasks_by_cat = None
+        if cat_names_filter is None:
+            cat_names = sorted(
+                d for d in os.listdir(args.bench_dir)
+                if os.path.isdir(os.path.join(args.bench_dir, d))
+            )
+        else:
+            cat_names = cat_names_filter
 
     total_done = 0
     total_skip = 0
     total_err  = 0
 
     for cat_name in cat_names:
-        cat_dir = os.path.join(args.bench_dir, cat_name)
-        if not os.path.isdir(cat_dir):
-            print(f'[Warning] Category 資料夾不存在，跳過：{cat_dir}')
-            continue
-
-        case_ids = sorted(
-            d for d in os.listdir(cat_dir)
-            if os.path.isdir(os.path.join(cat_dir, d))
-        )
-        if args.max_per_cat > 0:
-            case_ids = case_ids[:args.max_per_cat]
-
-        cat_done = 0
-        cat_skip = 0
-        cat_err  = 0
-        print(f'\n{"─" * 60}')
-        print(f'[Category] {cat_name}  ({len(case_ids)} 個案例)')
-        print(f'{"─" * 60}')
-
-        for idx, case_id in enumerate(case_ids):
-            case_dir  = os.path.join(cat_dir, case_id)
-            meta_path = os.path.join(case_dir, 'meta.json')
-            img_path  = os.path.join(case_dir, 'image.jpg')
-
-            # 基本路徑檢查
-            if not os.path.exists(meta_path):
-                print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ⚠ 找不到 meta.json，跳過')
-                cat_err += 1
+        # ── 收集此 category 的所有 case ──
+        if use_v1_format:
+            raw_cases = tasks_by_cat.get(cat_name, [])
+            if args.max_per_cat > 0:
+                raw_cases = raw_cases[:args.max_per_cat]
+            cases = []
+            for tc in raw_cases:
+                cases.append({
+                    'case_id':           tc['task_id'],
+                    'img_path':          tc['image_path'],
+                    'mask_path':         None,
+                    'source_prompt_raw': tc['original_prompt'],
+                    'target_prompt_raw': tc['editing_prompt'],
+                    'case_dir':          os.path.dirname(tc['image_path']),
+                    'meta_raw':          tc,
+                })
+        else:
+            cat_dir = os.path.join(args.bench_dir, cat_name)
+            if not os.path.isdir(cat_dir):
+                print(f'[Warn] 缺少 category 目錄：{cat_dir}')
                 continue
-            if not os.path.exists(img_path):
-                print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ⚠ 找不到 image.jpg，跳過')
-                cat_err += 1
-                continue
-
-            save_dir = os.path.join(args.output_dir, cat_name, case_id)
-            ensure_case_reference_symlink(case_dir, save_dir)
-
-            # 跳過已處理案例（必須存在且大小 > 0，避免中途中斷的空檔被跳過）
-            target_out = os.path.join(save_dir, 'target.jpg')
-            if args.skip_existing and os.path.exists(target_out) and os.path.getsize(target_out) > 0:
-                cat_skip += 1
-                total_skip += 1
-                print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ↓ 已存在，跳過')
-                continue
-
-            # 讀取 meta
-            try:
+            case_ids = sorted(
+                d for d in os.listdir(cat_dir)
+                if os.path.isdir(os.path.join(cat_dir, d))
+            )
+            if args.max_per_cat > 0:
+                case_ids = case_ids[:args.max_per_cat]
+            cases = []
+            for cid in case_ids:
+                case_dir  = os.path.join(cat_dir, cid)
+                meta_path = os.path.join(case_dir, 'meta.json')
+                img_path  = os.path.join(case_dir, 'image.jpg')
+                mask_path = os.path.join(case_dir, 'mask.png')
+                if not os.path.exists(meta_path) or not os.path.exists(img_path):
+                    cases.append({'case_id': cid, 'error': 'missing meta.json or image.jpg'})
+                    continue
                 with open(meta_path, 'r', encoding='utf-8') as f:
                     meta = json.load(f)
-            except Exception as e:
-                print(f'  [{idx+1}/{len(case_ids)}] {case_id}  ✗ meta.json 讀取失敗：{e}')
-                cat_err += 1
+                cases.append({
+                    'case_id':           cid,
+                    'img_path':          img_path,
+                    'mask_path':         mask_path,
+                    'source_prompt_raw': meta.get('source_prompt', ''),
+                    'target_prompt_raw': meta.get('target_prompt', ''),
+                    'case_dir':          case_dir,
+                    'meta_raw':          meta,
+                })
+
+        print(f'\n{"─" * 70}')
+        print(f'[Category] {cat_name} ({len(cases)} cases)')
+        print(f'{"─" * 70}')
+
+        for idx, case in enumerate(cases):
+            case_id = case['case_id']
+
+            if 'error' in case:
+                print(f'  [{idx+1}/{len(cases)}] {case_id}  ✗ {case["error"]}')
                 total_err += 1
                 continue
 
-            source_prompt = meta.get('source_prompt', '')
-            raw_target    = meta.get('target_prompt', '')
-            target_prompt = clean_target_prompt(raw_target)
-            blended_words = meta.get('blended_words', [])
-            src_diff_terms, tgt_diff_terms = derive_focus_terms_from_prompt_diff(
+            img_path          = case['img_path']
+            mask_path         = case.get('mask_path')
+            source_prompt_raw = case['source_prompt_raw']
+            target_prompt_raw = case['target_prompt_raw']
+            case_dir          = case['case_dir']
+
+            if not os.path.exists(img_path):
+                print(f'  [{idx+1}/{len(cases)}] {case_id}  ✗ 找不到圖片：{img_path}')
+                total_err += 1
+                continue
+
+            save_dir   = os.path.join(args.output_dir, cat_name, case_id)
+            target_out = os.path.join(save_dir, 'target.jpg')
+            if args.skip_existing and os.path.exists(target_out) and os.path.getsize(target_out) > 0:
+                total_skip += 1
+                print(f'  [{idx+1}/{len(cases)}] {case_id}  ↓ 已存在，跳過')
+                mask_stats = collect_mask_stats(mask_path) if mask_path else {'mask_exists': False}
+                write_task_info(save_dir, {
+                    'category':   cat_name,
+                    'case_id':    case_id,
+                    'case_dir':   case_dir,
+                    'status':     'skipped_existing',
+                    'timestamp':  datetime.datetime.now().isoformat(),
+                    'image_path': img_path,
+                    'target_path': target_out,
+                    'log_path':   os.path.join(save_dir, 'case.log'),
+                    'mask_stats': mask_stats,
+                })
+                continue
+
+            # ── 清理 prompt 與推導 focus words ──
+            source_prompt = clean_target_prompt(source_prompt_raw)
+            target_prompt = clean_target_prompt(target_prompt_raw)
+            src_focus_words, tgt_focus_words = derive_focus_terms_from_prompt_diff(
                 source_prompt, target_prompt
             )
-            source_focus_words = src_diff_terms
-            target_focus_words = tgt_diff_terms
+            src_focus_str = ' '.join(src_focus_words)
+            tgt_focus_str = ' '.join(tgt_focus_words)
 
-            print(f'\n  [{idx+1}/{len(case_ids)}] {case_id}')
-            print(f'    src : {source_prompt}')
-            print(f'    tgt : {target_prompt}')
-            print(f'    focus ← "{source_focus_words}"  → "{target_focus_words}"')
+            mask_stats = collect_mask_stats(mask_path) if mask_path else {'mask_exists': False}
 
-            # PIE mask 路徑（若啟用）
+            print(f'\n  [{idx+1}/{len(cases)}] {case_id}')
+            print(f'    src_prompt : {source_prompt}')
+            print(f'    tgt_prompt : {target_prompt}')
+            print(f'    src_focus  : {src_focus_str}')
+            print(f'    tgt_focus  : {tgt_focus_str}')
+            if mask_stats.get('mask_exists'):
+                print(f'    mask_ratio : white={mask_stats["white_percent"]}%  black={mask_stats["black_percent"]}%')
+
+            # PIE mask（use_pie_mask=1/2 時啟用）
             pie_mask_path: Optional[str] = None
-            if args.use_pie_mask:
-                _mpath = os.path.join(case_dir, 'mask.png')
-                if os.path.exists(_mpath):
-                    pie_mask_path = _mpath
-                else:
-                    print(f'    ⚠ mask.png 不存在，fallback 至 attention mask 模式')
+            if int(args.use_pie_mask) in (1, 2) and mask_path and os.path.exists(mask_path):
+                pie_mask_path = mask_path
+
+            # ref_mask_rle 供 dynamic threshold 使用
+            _ref_mask_rle = None
+            if int(args.use_dynamic_threshold) and use_v1_format:
+                _ref_mask_rle = case.get('meta_raw', {}).get('mask', None)
+
+            t_start = time.time()
+            os.makedirs(save_dir, exist_ok=True)
+            case_log_path = os.path.join(save_dir, 'case.log')
 
             try:
-                t_start = time.time()
-                run_one_case(
-                    infinity=infinity,
-                    vae=vae,
-                    text_tokenizer=text_tokenizer,
-                    text_encoder=text_encoder,
-                    source_image_path=img_path,
-                    source_prompt=source_prompt,
-                    target_prompt=target_prompt,
-                    source_focus_words=source_focus_words,
-                    target_focus_words=target_focus_words,
-                    save_dir=save_dir,
-                    args=args,
-                    scale_schedule=scale_schedule,
-                    attn_block_indices=attn_block_indices,
-                    total_scales=total_scales,
-                    device_cuda=device_cuda,
-                    mask_path=pie_mask_path,
-                    blended_words=blended_words,
-                    case_source_dir=case_dir,
-                )
+                with open(case_log_path, 'a', encoding='utf-8') as case_log:
+                    case_log.write('\n' + '=' * 80 + '\n')
+                    case_log.write(f'timestamp: {datetime.datetime.now().isoformat()}\n')
+                    case_log.write(f'category: {cat_name}, case_id: {case_id}\n')
+                    case_log.write(f'source_prompt: {source_prompt}\n')
+                    case_log.write(f'target_prompt: {target_prompt}\n')
+                    case_log.write(f'source_focus: {src_focus_str}\n')
+                    case_log.write(f'target_focus: {tgt_focus_str}\n')
+                    case_log.write(f'mask_stats: {json.dumps(mask_stats, ensure_ascii=False)}\n')
+                    case_log.write('-' * 80 + '\n')
+
+                    tee_out = TeeStream(sys.stdout, case_log)
+                    tee_err = TeeStream(sys.stderr, case_log)
+
+                    with contextlib.redirect_stdout(tee_out), contextlib.redirect_stderr(tee_err):
+                        run_one_case(
+                            infinity=infinity,
+                            vae=vae,
+                            text_tokenizer=text_tokenizer,
+                            text_encoder=text_encoder,
+                            source_image_path=img_path,
+                            source_prompt=source_prompt,
+                            target_prompt=target_prompt,
+                            source_focus_words=src_focus_words,
+                            target_focus_words=tgt_focus_words,
+                            save_dir=save_dir,
+                            args=args,
+                            scale_schedule=scale_schedule,
+                            attn_block_indices=attn_block_indices,
+                            total_scales=total_scales,
+                            device_cuda=device_cuda,
+                            mask_path=pie_mask_path,
+                            blended_words=None,
+                            case_source_dir=case_dir,
+                            ref_mask_rle=_ref_mask_rle,
+                        )
+
                 elapsed = time.time() - t_start
-                # 儲存 timing.json
-                timing_path = os.path.join(save_dir, 'timing.json')
-                with open(timing_path, 'w') as f_t:
-                    json.dump({'inference_sec': round(elapsed, 3)}, f_t)
-                cat_done  += 1
+                os.makedirs(save_dir, exist_ok=True)
+                with open(os.path.join(save_dir, 'timing.json'), 'w', encoding='utf-8') as tf:
+                    json.dump({'inference_sec': round(elapsed, 3)}, tf)
+                write_task_info(save_dir, {
+                    'category':              cat_name,
+                    'case_id':               case_id,
+                    'case_dir':              case_dir,
+                    'status':                'success',
+                    'timestamp':             datetime.datetime.now().isoformat(),
+                    'elapsed_sec':           round(elapsed, 3),
+                    'image_path':            img_path,
+                    'mask_path':             mask_path,
+                    'source_prompt_raw':     source_prompt_raw,
+                    'target_prompt_raw':     target_prompt_raw,
+                    'source_prompt_clean':   source_prompt,
+                    'target_prompt_clean':   target_prompt,
+                    'source_focus_words':    src_focus_words,
+                    'target_focus_words':    tgt_focus_words,
+                    'source_focus_string':   src_focus_str,
+                    'target_focus_string':   tgt_focus_str,
+                    'mask_stats':            mask_stats,
+                    'target_path':           target_out,
+                    'timing_path':           os.path.join(save_dir, 'timing.json'),
+                    'log_path':              case_log_path,
+                })
                 total_done += 1
-                print(f'    ✓  → {save_dir}/target.jpg  ({elapsed:.1f}s)')
+                print(f'    ✓ done ({elapsed:.1f}s) -> {target_out}')
 
             except Exception as exc:
-                cat_err  += 1
                 total_err += 1
-                print(f'    ✗  Error：{exc}')
+                print(f'    ✗ failed: {exc}')
                 traceback.print_exc()
+                elapsed = time.time() - t_start
+                with open(os.path.join(save_dir, 'timing.json'), 'w', encoding='utf-8') as tf:
+                    json.dump({'inference_sec': round(elapsed, 3)}, tf)
+                write_task_info(save_dir, {
+                    'category':              cat_name,
+                    'case_id':               case_id,
+                    'case_dir':              case_dir,
+                    'status':                'failed',
+                    'timestamp':             datetime.datetime.now().isoformat(),
+                    'elapsed_sec':           round(elapsed, 3),
+                    'error':                 str(exc),
+                    'image_path':            img_path,
+                    'mask_path':             mask_path,
+                    'source_prompt_raw':     source_prompt_raw,
+                    'target_prompt_raw':     target_prompt_raw,
+                    'source_prompt_clean':   source_prompt,
+                    'target_prompt_clean':   target_prompt,
+                    'source_focus_words':    src_focus_words,
+                    'target_focus_words':    tgt_focus_words,
+                    'source_focus_string':   src_focus_str,
+                    'target_focus_string':   tgt_focus_str,
+                    'mask_stats':            mask_stats,
+                    'target_path':           target_out,
+                    'timing_path':           os.path.join(save_dir, 'timing.json'),
+                    'log_path':              case_log_path,
+                })
                 torch.cuda.empty_cache()
 
-        print(f'\n  [Category 小計] {cat_name}：✓{cat_done}  ↓{cat_skip}  ✗{cat_err}')
-
     print('\n' + '=' * 80)
-    print(f'PIE-Bench 批量評估完成')
+    print('PIE-Bench 批量評估完成')
     print(f'  ✓ 成功：{total_done}')
     print(f'  ↓ 跳過：{total_skip}')
     print(f'  ✗ 錯誤：{total_err}')

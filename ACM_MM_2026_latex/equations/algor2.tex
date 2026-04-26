@@ -11,25 +11,26 @@
 
 \For{$k = 1$ \textbf{to} $S$}
 
-    \Statex \textit{\quad Phase 1: Source Generation and Mask Extraction}
+    \Statex \textit{\quad Phase 1: Source-Stream Mask Extraction}
     \State Generate tokens at scale $k$ conditioned on $P_s$
     \If{$k \ge N$}
         \State Compute $a_{k,b}$ for focus words $\mathcal{F}_s$; filter via IQR $\to \hat{a}_k^{(s)}$
-        \State $\tau_k^{(s)} \gets \mathrm{AdaptiveThreshold}(\hat{a}_k^{(s)})$ \Comment{percentile adjusted by attention distribution}
-        \State $M_{k,s}^{\mathrm{f}} \gets \mathbb{1}[\hat{a}_k^{(s)} \ge \tau_k^{(s)}]$,\quad
-               $M_{k,s}^{\mathrm{p}} \gets \mathbb{1}[\hat{a}_k^{(s)} \le \tau_k^{\mathrm{low}}]$
+        \State $\tau_k^{(s)},\, \tau_k^{\mathrm{low},(s)} \gets \mathrm{AdaptiveThreshold}(\hat{a}_k^{(s)})$ \Comment{Alg.~\ref{alg:adaptive_threshold}}
+        \State $M_{k,s}^{\mathrm{f}} \gets \mathbf{1}[\hat{a}_k^{(s)} \ge \tau_k^{(s)}]$,\quad
+               $M_{k,s}^{\mathrm{p}} \gets \mathbf{1}[\hat{a}_k^{(s)} \le \tau_k^{\mathrm{low},(s)}]$
     \EndIf
 
-    \Statex \textit{\quad Phase 2: Target Focus Mask}
+    \Statex \textit{\quad Phase 2: Target-Stream Mask Extraction (with Background Anchoring)}
     \State Generate tokens at scale $k$ conditioned on $P_t$
     \If{$k \ge N$}
-        \State Anchor positions where $M_{k,s}^{\mathrm{p}}{=}1$ to $r_k^s$
+        \State Anchor positions where $M_{k,s}^{\mathrm{p}}{=}1$ to $r_k^s$ \Comment{hard background lock}
         \State Compute $a_{k,b}$ for focus words $\mathcal{F}_t$; filter via IQR $\to \hat{a}_k^{(t)}$
-        \State $\tau_k^{(t)} \gets \mathrm{AdaptiveThreshold}(\hat{a}_k^{(t)})$
-        \State $M_{k,t}^{\mathrm{f}} \gets \mathbb{1}[\hat{a}_k^{(t)} \ge \tau_k^{(t)}]$
+        \State $\tau_k^{(t)},\, \_ \gets \mathrm{AdaptiveThreshold}(\hat{a}_k^{(t)})$
+        \State $M_{k,t}^{\mathrm{f}} \gets \mathbf{1}[\hat{a}_k^{(t)} \ge \tau_k^{(t)}]$
+        \State $M_{k,t}^{\mathrm{f}} \gets M_{k,t}^{\mathrm{f}} \;\wedge\; \neg\, M_{k,s}^{\mathrm{p}}$ \Comment{preserve overrides target focus}
     \EndIf
 
-    \Statex \textit{\quad Phase 3: Target Generation with Token Replacement}
+    \Statex \textit{\quad Phase 3: Mask-Guided Token Composition}
     \State $M_k^{\mathrm{rep}} \gets \neg\!\bigl(M_{k,s}^{\mathrm{f}} \cup M_{k,t}^{\mathrm{f}}\bigr)$
     \State Generate $g_k$ at scale $k$ conditioned on $P_t$
     \If{$k < N$}

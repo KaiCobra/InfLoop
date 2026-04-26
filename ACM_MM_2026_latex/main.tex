@@ -49,30 +49,30 @@
 \documentclass[sigconf, screen, review, anonymous]{acmart}
 %%
 %% \BibTeX command to typeset BibTeX logo in the docs
-\AtBeginDocument{%
-  \providecommand\BibTeX{{%
-    Bib\TeX}}}
+% \AtBeginDocument{%
+%   \providecommand\BibTeX{{%
+%     Bib\TeX}}}
 
-%% Rights management information.  This information is sent to you
-%% when you complete the rights form.  These commands have SAMPLE
-%% values in them; it is your responsibility as an author to replace
-%% the commands and values with those provided to you when you
-%% complete the rights form.
-\setcopyright{acmlicensed}
-\copyrightyear{2018}
-\acmYear{2018}
-\acmDOI{XXXXXXX.XXXXXXX}
-%% These commands are for a PROCEEDINGS abstract or paper.
-\acmConference[Conference acronym 'XX]{Make sure to enter the correct
-  conference title from your rights confirmation email}{June 03--05,
-  2018}{Woodstock, NY}
-%%
-%%  Uncomment \acmBooktitle if the title of the proceedings is different
-%%  from ``Proceedings of ...''!
-%%
-%%\acmBooktitle{Woodstock '18: ACM Symposium on Neural Gaze Detection,
-%%  June 03--05, 2018, Woodstock, NY}
-\acmISBN{978-1-4503-XXXX-X/2018/06}
+% %% Rights management information.  This information is sent to you
+% %% when you complete the rights form.  These commands have SAMPLE
+% %% values in them; it is your responsibility as an author to replace
+% %% the commands and values with those provided to you when you
+% %% complete the rights form.
+% \setcopyright{acmlicensed}
+% \copyrightyear{2018}
+% \acmYear{2018}
+% \acmDOI{XXXXXXX.XXXXXXX}
+% %% These commands are for a PROCEEDINGS abstract or paper.
+% \acmConference[Conference acronym 'XX]{Make sure to enter the correct
+%   conference title from your rights confirmation email}{June 03--05,
+%   2018}{Woodstock, NY}
+% %%
+% %%  Uncomment \acmBooktitle if the title of the proceedings is different
+% %%  from ``Proceedings of ...''!
+% %%
+% %%\acmBooktitle{Woodstock '18: ACM Symposium on Neural Gaze Detection,
+% %%  June 03--05, 2018, Woodstock, NY}
+% \acmISBN{978-1-4503-XXXX-X/2018/06}
 
 \usepackage{booktabs}
 % xcolor is already loaded by acmart with [prologue]; table option passed via \PassOptionsToPackage above
@@ -87,48 +87,48 @@
 \usepackage{ulem}
 \usepackage{microtype}
 % 顏色強度範圍：5 ~ 80
-\newcommand{\MinShade}{0}
-\newcommand{\MaxShade}{85}
+% \newcommand{\MinShade}{0}
+% \newcommand{\MaxShade}{85}
 
-% 自動上色：越大越好
-\newcommand{\AutoCellUp}[4]{%  ← 改成4個參數
-  \begingroup
-  % \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*((#1-#2)/(#3-#2)))))}%
-  \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*(((#1-#2)/(#3-#2))^2))))}%
-  \edef\ShadeValue{\pgfmathresult}%
-  \edef\ColorSpec{cyan!\ShadeValue}%
-  \pgfmathparse{(#1==#3 ? 1 : 0)}%
-  \ifnum\pgfmathresult=1
-    \expandafter\cellcolor\expandafter{\ColorSpec}\textbf{#1}%
-  \else
-    \ifnum#4=1
-      \expandafter\cellcolor\expandafter{\ColorSpec}\uline{#1}%
-    \else
-      \expandafter\cellcolor\expandafter{\ColorSpec}#1%
-    \fi
-  \fi
-  \endgroup
-}
+% % 自動上色：越大越好
+% \newcommand{\AutoCellUp}[4]{%  ← 改成4個參數
+%   \begingroup
+%   % \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*((#1-#2)/(#3-#2)))))}%
+%   \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*(((#1-#2)/(#3-#2))^2))))}%
+%   \edef\ShadeValue{\pgfmathresult}%
+%   \edef\ColorSpec{cyan!\ShadeValue}%
+%   \pgfmathparse{(#1==#3 ? 1 : 0)}%
+%   \ifnum\pgfmathresult=1
+%     \expandafter\cellcolor\expandafter{\ColorSpec}\textbf{#1}%
+%   \else
+%     \ifnum#4=1
+%       \expandafter\cellcolor\expandafter{\ColorSpec}\uline{#1}%
+%     \else
+%       \expandafter\cellcolor\expandafter{\ColorSpec}#1%decent
+%     \fi
+%   \fi
+%   \endgroup
+% }
 
-% 自動上色：越小越好
-\newcommand{\AutoCellDown}[4]{%
-  \begingroup
-  % \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*((#3-#1)/(#3-#2)))))}%
-  \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*(((#3-#1)/(#3-#2))^2))))}%
-  \edef\ShadeValue{\pgfmathresult}%
-  \edef\ColorSpec{cyan!\ShadeValue}%
-  \pgfmathparse{(#1==#2 ? 1 : 0)}%
-  \ifnum\pgfmathresult=1
-    \expandafter\cellcolor\expandafter{\ColorSpec}\textbf{#1}%
-  \else
-    \ifnum#4=1
-      \expandafter\cellcolor\expandafter{\ColorSpec}\uline{#1}%
-    \else
-      \expandafter\cellcolor\expandafter{\ColorSpec}#1%
-    \fi
-  \fi
-  \endgroup
-}
+% % 自動上色：越小越好
+% \newcommand{\AutoCellDown}[4]{%
+%   \begingroup
+%   % \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*((#3-#1)/(#3-#2)))))}%
+%   \pgfmathparse{round(max(\MinShade,min(\MaxShade,\MinShade + (\MaxShade-\MinShade)*(((#3-#1)/(#3-#2))^2))))}%
+%   \edef\ShadeValue{\pgfmathresult}%
+%   \edef\ColorSpec{cyan!\ShadeValue}%
+%   \pgfmathparse{(#1==#2 ? 1 : 0)}%
+%   \ifnum\pgfmathresult=1
+%     \expandafter\cellcolor\expandafter{\ColorSpec}\textbf{#1}%
+%   \else
+%     \ifnum#4=1
+%       \expandafter\cellcolor\expandafter{\ColorSpec}\uline{#1}%
+%     \else
+%       \expandafter\cellcolor\expandafter{\ColorSpec}#1%
+%     \fi
+%   \fi
+%   \endgroup
+% }
 % =======================
 %%
 %% Submission ID.
@@ -170,20 +170,20 @@
 %%
 %% The "title" command has an optional parameter,
 %% allowing the author to define a "short title" to be used in page headers.
-\title{Understanding Before Editing: Training-Free Text-Guided Image Editing via VAR Cross-Modal Attention}
+\title{Supplementary}
 
-\input{tex/0_authors}
-\input{tex/1_abstract}
+% \input{tex/0_authors}
+% \input{tex/1_abstract}
 
 %% A "teaser" image appears between the author and affiliation
 %% information and the body of the document, and typically spans the
 %% page.
-\begin{teaserfigure}
-  \includegraphics[width=\textwidth]{teaser/imageEditing.png}
-  \caption{Diverse editing results of our training-free, inversion-free framework on a 2B-parameter VAR model. Each pair shows source and edited images side by side or top and bottom, spanning object replacement, addition and attribute modification. Our method constructs attention-driven spatial masks and performs discrete token-level composition, achieving precise edits with faithful background preservation.}
-  \Description{A gallery of source-edited image pairs demonstrating diverse text-guided editing results including object replacement, addition, style transfer, and attribute modification.}
-  \label{fig:teaser}
-\end{teaserfigure}
+% \begin{teaserfigure}
+%   \includegraphics[width=\textwidth]{teaser/imageEditing.png}
+%   \caption{Diverse editing results of our training-free, inversion-free framework on a 2B-parameter VAR model. Each pair shows source and edited images side by side or top and bottom, spanning object replacement, addition and attribute modification. Our method constructs attention-driven spatial masks and performs discrete token-level composition, achieving precise edits with faithful background preservation.}
+%   \Description{A gallery of source-edited image pairs demonstrating diverse text-guided editing results including object replacement, addition, style transfer, and attribute modification.}
+%   \label{fig:teaser}
+% \end{teaserfigure}
 
 % \received{20 February 2007}
 % \received[revised]{12 March 2009}
@@ -193,11 +193,11 @@
 %% This command processes the author and affiliation and title
 %% information and builds the first part of the formatted document.
 \maketitle
-\input{tex/2_introduction} 
-\input{tex/3_relatedWorks}
-\input{tex/4_method}
-\input{tex/5_Experiments}
-\input{tex/6_conclusion}
+% \input{tex/2_introduction} 
+% \input{tex/3_relatedWorks}
+% \input{tex/4_method}
+% \input{tex/5_Experiments}
+% \input{tex/6_conclusion}
 
 
 %%
@@ -212,16 +212,15 @@
 %%
 %% The next two lines define the bibliography style to be used, and
 %% the bibliography file.
-\newpage
-\bibliographystyle{ACM-Reference-Format}
-\bibliography{main}
+% \bibliographystyle{ACM-Reference-Format}
+% \bibliography{main}
 
 
 %%
 %% If your work has an appendix, this is the place to put it.
-% \appendix
+\appendix
 
-% \input{tex/supplementary}
+\input{tex/supplementary}
 
 \end{document}
 \endinput

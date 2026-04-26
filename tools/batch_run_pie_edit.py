@@ -211,11 +211,15 @@ def main() -> None:
                         help="使用 reference mask 引導的二分法搜尋 attention threshold（0=停用，1=啟用）")
     parser.add_argument("--dynamic_threshold_iters", type=int, default=20,
                         help="二分法最大迭代次數（預設 20）")
-    parser.add_argument("--threshold_method", type=int, default=1, choices=list(range(1, 14)),
+    parser.add_argument("--threshold_method", type=int, default=1, choices=list(range(1, 15)),
                         help='閾值方法：1=固定percentile 2=dynamic ternary 3=Otsu 4=FFT+Otsu '
                              '5=SpectralEnergy 6=EdgeCoherence 7=GMM 8=Composite '
                              '9=IPR 10=Entropy 11=BlockConsensus 12=Kneedle '
-                             '13=MetaAdaptive。預設：1')
+                             '13=MetaAdaptive 14=Absolute(norm>high/<low)。預設：1')
+    parser.add_argument("--absolute_high", type=float, default=0.7,
+                        help='Method 14 focus 閾值（正規化後 >= absolute_high 為 focus）。預設：0.7')
+    parser.add_argument("--absolute_low", type=float, default=0.3,
+                        help='Method 14 preserve 閾值（正規化後 < absolute_low 為 preserve）。預設：0.3')
 
     args = parser.parse_args()
 

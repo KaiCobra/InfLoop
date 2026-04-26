@@ -1,3 +1,12 @@
 .omc/
 CLAUDE.md
 olp_4HfKuqysBI7fd3bPq1pq5xNcTIgBRK1ki3S3
+olp_7ptmhhTnivOhR9P20Ltys0bj6HvNUX144f6S
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.pdf

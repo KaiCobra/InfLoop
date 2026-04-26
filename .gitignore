@@ -48,4 +48,4 @@ wandb
 .DS_Store
 exp_prompt/*
 *.pkl
-ACM_MM_2026_latex/
+ACM_MM_2026_latex

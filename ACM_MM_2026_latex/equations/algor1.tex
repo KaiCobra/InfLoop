@@ -1,14 +1,17 @@
 \begin{algorithm}[t]
-\caption{Adaptive Mask Thresholding}
+\caption{Adaptive Mask Thresholding via Coefficient of Variation}
 \label{alg:adaptive_threshold}
 \small
 \begin{algorithmic}[1]
-\Require Filtered attention $\hat{a}_k$, base threshold $\tau_{\mathrm{base}}$, percentile range $[p_{\min}, p_{\max}]$
-\Ensure Adaptive threshold $\tau_k$
+\Require Filtered attention $\hat{a}_k$, CV range $[\mathit{CV}_{\min}, \mathit{CV}_{\max}]$, multiplier range $[\kappa_{\min}, \kappa_{\max}]$
+\Ensure Focus threshold $\tau_k$, preserve threshold $\tau_k^{\mathrm{low}}$
 
-\State $\rho \gets \frac{|\{i : \hat{a}_k[i] > \tau_{\mathrm{base}}\}|}{N_v}$ \Comment{hot-spot ratio}
-\State $p \gets p_{\min} + \rho \cdot (p_{\max} - p_{\min})$ \Comment{linear mapping}
-\State $\tau_k \gets \mathrm{Percentile}(\hat{a}_k,\; p)$
-\State \Return $\tau_k$
+\State $\mu \gets \mathrm{mean}(\hat{a}_k)$;\quad $\sigma \gets \mathrm{std}(\hat{a}_k)$ \Comment{first two moments}
+\State $\mathit{CV} \gets \sigma\,/\,(\mu + \varepsilon)$ \Comment{coefficient of variation}
+\State $\kappa \gets \kappa_{\max} - (\mathit{CV} - \mathit{CV}_{\min}) \cdot (\kappa_{\max} - \kappa_{\min})\,/\,(\mathit{CV}_{\max} - \mathit{CV}_{\min})$
+\State $\kappa \gets \mathrm{clamp}(\kappa,\; \kappa_{\min},\; \kappa_{\max})$ \Comment{low CV $\to$ large $\kappa$}
+\State $\tau_k \gets \mu + \kappa \cdot \sigma$ \Comment{focus threshold}
+\State $\tau_k^{\mathrm{low}} \gets \mu - \kappa \cdot \sigma$ \Comment{preserve threshold}
+\State \Return $\tau_k,\; \tau_k^{\mathrm{low}}$
 \end{algorithmic}
 \end{algorithm}

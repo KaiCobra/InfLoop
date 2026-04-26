@@ -39,6 +39,7 @@ METHOD_ENTROPY = 10
 METHOD_BLOCK_CONSENSUS = 11
 METHOD_KNEEDLE = 12
 METHOD_META_ADAPTIVE = 13
+METHOD_ABSOLUTE = 14
 
 METHOD_NAMES = {
     1: "Fixed Percentile",
@@ -54,6 +55,7 @@ METHOD_NAMES = {
     11: "Block Consensus Voting",
     12: "Kneedle (Elbow Detection)",
     13: "Meta-Adaptive (CV→k)",
+    14: "Absolute (normalized >high / <low)",
 }
 
 
@@ -921,10 +923,10 @@ def threshold_kneedle(
 def threshold_meta_adaptive(
     filtered_attn: np.ndarray,
     low_attn: bool = False,
-    cv_min: float = 0.5,
-    cv_max: float = 1.5,
-    k_min: float = 1.5,
-    k_max: float = 4.5,
+    cv_min: float = 0.0,
+    cv_max: float = 1.0,
+    k_min: float = 0.2,
+    k_max: float = 0.5,
     **_kwargs,
 ) -> Tuple[float, np.ndarray, str]:
     """
@@ -963,6 +965,51 @@ def threshold_meta_adaptive(
 
 
 # =====================================================================
+#  方法 14：Absolute Threshold（正規化後固定上下界）
+# =====================================================================
+def threshold_absolute(
+    filtered_attn: np.ndarray,
+    low_attn: bool = False,
+    absolute_high: float = 0.7,
+    absolute_low: float = 0.3,
+    **_kwargs,
+) -> Tuple[float, np.ndarray, str]:
+    """
+    先將 attention 正規化到 [0, 1]（min-max），再以固定絕對閾值二值化。
+
+    focus mask   (low_attn=False): normalized attention >= absolute_high
+    preserve mask (low_attn=True): normalized attention <  absolute_low
+
+    Args:
+        absolute_high: focus 閾值（0~1），預設 0.7
+        absolute_low:  preserve 閾值（0~1），預設 0.3
+
+    Returns:
+        (threshold, normalized_attn, info_str)
+    """
+    mn = float(filtered_attn.min())
+    mx = float(filtered_attn.max())
+
+    if mx - mn < 1e-10:
+        thr = absolute_high if not low_attn else absolute_low
+        info = f"absolute: uniform attn, thr={thr:.2f}"
+        return thr, filtered_attn, info
+
+    normalized = ((filtered_attn - mn) / (mx - mn)).astype(np.float32)
+
+    if low_attn:
+        thr = float(absolute_low)
+        coverage = float((normalized < thr).mean()) * 100
+        info = f"absolute: preserve < {thr:.2f}, coverage={coverage:.1f}%"
+    else:
+        thr = float(absolute_high)
+        coverage = float((normalized >= thr).mean()) * 100
+        info = f"absolute: focus >= {thr:.2f}, coverage={coverage:.1f}%"
+
+    return thr, normalized, info
+
+
+# =====================================================================
 #  統一入口
 # =====================================================================
 def compute_threshold(
@@ -981,6 +1028,12 @@ def compute_threshold(
     R_min: float = 0.3,
     shrink_gamma: float = 1.0,
     attn_stack: Optional[np.ndarray] = None,
+    cv_min: float = 0.0,
+    cv_max: float = 1.0,
+    k_min: float = 0.2,
+    k_max: float = 0.5,
+    absolute_high: float = 0.7,
+    absolute_low: float = 0.3,
 ) -> Tuple[float, np.ndarray, str]:
     """
     統一閾值計算入口。
@@ -1052,7 +1105,13 @@ def compute_threshold(
         return threshold_kneedle(filtered_attn, low_attn)
 
     elif method == METHOD_META_ADAPTIVE:
-        return threshold_meta_adaptive(filtered_attn, low_attn)
+        return threshold_meta_adaptive(filtered_attn, low_attn,
+                                       cv_min=cv_min, cv_max=cv_max,
+                                       k_min=k_min, k_max=k_max)
+
+    elif method == METHOD_ABSOLUTE:
+        return threshold_absolute(filtered_attn, low_attn,
+                                  absolute_high=absolute_high, absolute_low=absolute_low)
 
     else:
         raise ValueError(

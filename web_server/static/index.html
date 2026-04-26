@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="utf-8">
+<title>PIE-Bench Image Browser</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: "Palatino Linotype", "Palatino", "Book Antiqua", "Noto Sans TC", serif; background: #1a1a2e; color: #eee; display: flex; height: 100vh; overflow: hidden; }
+
+/* ── Left Panel (Gallery) ── */
+#left-panel {
+  width: 420px; min-width: 420px; display: flex; flex-direction: column;
+  border-right: 2px solid #333; background: #16213e;
+}
+#controls {
+  padding: 10px 12px; border-bottom: 1px solid #333; background: #0f3460;
+  display: flex; flex-direction: column; gap: 6px;
+}
+#controls h2 { font-size: 18px; margin-bottom: 4px; }
+#controls select, #controls input {
+  padding: 8px 10px; border-radius: 4px; border: 1px solid #555;
+  background: #1a1a2e; color: #eee; font-size: 15px; width: 100%;
+  font-family: inherit;
+}
+#gallery {
+  flex: 1; overflow-y: auto; padding: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.card {
+  display: flex; gap: 6px; padding: 6px; border-radius: 6px;
+  background: #1a1a2e; cursor: pointer; border: 2px solid transparent;
+  transition: border-color .15s, background .15s; align-items: center;
+}
+.card:hover { border-color: #e94560; background: #222; }
+.card.selected { border-color: #0ff; background: #0a2540; }
+.card img { width: 80px; height: 80px; object-fit: cover; border-radius: 4px; }
+.card-info { flex: 1; font-size: 14px; overflow: hidden; }
+.card-info .id { font-weight: bold; color: #0ff; font-size: 15px; }
+.card-info .simp { color: #f0c040; margin-top: 3px; font-size: 14px; }
+.card-info .cat { color: #888; font-size: 13px; margin-top: 2px; }
+
+/* ── Right Panel (Canvas) ── */
+#right-panel { flex: 1; display: flex; flex-direction: column; background: #0d1117; }
+#canvas-toolbar {
+  padding: 8px 14px; display: flex; align-items: center; gap: 12px;
+  border-bottom: 1px solid #333; background: #161b22;
+}
+#canvas-toolbar label { font-size: 15px; }
+#canvas-toolbar select, #canvas-toolbar input[type=number] {
+  padding: 5px 8px; border-radius: 4px; border: 1px solid #555;
+  background: #1a1a2e; color: #eee; font-size: 15px; width: 70px;
+  font-family: inherit;
+}
+#canvas-toolbar .spacer { flex: 1; }
+#btn-copy, #btn-clear, #btn-select-all, #btn-download {
+  padding: 8px 16px; border-radius: 4px; border: none;
+  font-size: 15px; cursor: pointer; font-weight: 600;
+  font-family: inherit;
+}
+#btn-copy { background: #238636; color: #fff; }
+#btn-copy:hover { background: #2ea043; }
+#btn-download { background: #1f6feb; color: #fff; }
+#btn-download:hover { background: #388bfd; }
+#btn-clear { background: #da3633; color: #fff; }
+#btn-clear:hover { background: #f85149; }
+#btn-select-all { background: #6e40c9; color: #fff; }
+#btn-select-all:hover { background: #8957e5; }
+#canvas-count { font-size: 15px; color: #8b949e; }
+
+#canvas-area {
+  flex: 1; overflow: auto; display: flex; justify-content: center;
+  padding: 20px;
+}
+/* A4 paper pages container */
+#papers-wrapper {
+  display: flex; flex-direction: column; gap: 24px; align-items: center;
+}
+.paper-page {
+  background: #fff; color: #111; box-shadow: 0 4px 24px rgba(0,0,0,.5);
+  padding: 24px;
+  font-family: "Palatino Linotype", "Palatino", "Book Antiqua", serif;
+  width: 794px; /* ~210mm at 96dpi */
+  min-height: 1123px; /* ~297mm */
+  position: relative;
+}
+.page-number { display: none; }
+.paper-grid {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(3, 1fr);
+}
+.paper-item { text-align: center; }
+.paper-item .pair {
+  display: flex; gap: 4px; justify-content: center;
+}
+.paper-item .pair img {
+  width: 100%; height: auto; object-fit: cover; border: 1px solid #ccc;
+}
+.paper-item .pair .img-wrapper {
+  flex: 1; display: flex; flex-direction: column; align-items: center;
+}
+.paper-item .pair .img-label {
+  font-size: 18px; color: #666; margin-bottom: 2px;
+}
+.paper-item .prompt-line {
+  font-size: 18px; color: #333; margin-top: 4px; font-style: italic;
+  word-break: break-word;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: #111; }
+::-webkit-scrollbar-thumb { background: #444; border-radius: 4px; }
+
+/* Toast */
+#toast {
+  position: fixed; bottom: 30px; right: 30px; padding: 12px 20px;
+  background: #238636; color: #fff; border-radius: 8px;
+  font-size: 16px; font-weight: 600; opacity: 0;
+  transition: opacity .3s; pointer-events: none; z-index: 999;
+}
+#toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+
+<!-- LEFT -->
+<div id="left-panel">
+  <div id="controls">
+    <h2>PIE-Bench Browser</h2>
+    <select id="filter-cat">
+      <option value="all">All Categories</option>
+    </select>
+    <input id="search" type="text" placeholder="Search prompt / ID ...">
+  </div>
+  <div id="gallery"></div>
+</div>
+
+<!-- RIGHT -->
+<div id="right-panel">
+  <div id="canvas-toolbar">
+    <span id="canvas-count">Selected: 0</span>
+    <label>Columns:
+      <input type="number" id="col-count" value="3" min="1" max="6">
+    </label>
+    <div class="spacer"></div>
+    <button id="btn-select-all">Select Filtered</button>
+    <button id="btn-clear">Clear</button>
+    <button id="btn-copy">Copy Page</button>
+    <button id="btn-download">Download PNGs</button>
+  </div>
+  <div id="canvas-area">
+    <div id="papers-wrapper"></div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+// ── State ──
+let allData = [];
+let selected = new Set(JSON.parse(localStorage.getItem('pie_selected') || '[]'));
+let filteredIds = [];       // currently visible ids
+
+function saveSelection() {
+  localStorage.setItem('pie_selected', JSON.stringify([...selected]));
+}
+
+// ── Init ──
+fetch("/api/data").then(r => r.json()).then(data => {
+  allData = data;
+  buildCategoryFilter();
+  render();
+  if (selected.size > 0) renderPaper();
+});
+
+// ── Category filter ──
+function buildCategoryFilter() {
+  const cats = [...new Set(allData.map(d => d.category))].sort();
+  const sel = document.getElementById("filter-cat");
+  cats.forEach(c => {
+    const o = document.createElement("option");
+    o.value = c; o.textContent = c;
+    sel.appendChild(o);
+  });
+}
+
+// ── Render gallery ──
+function render() {
+  const cat = document.getElementById("filter-cat").value;
+  const q = document.getElementById("search").value.toLowerCase().trim();
+
+  const filtered = allData.filter(d => {
+    if (cat !== "all" && d.category !== cat) return false;
+    if (q) {
+      const hay = (d.id + " " + d.original_prompt + " " + d.editing_prompt + " " + d.simplified).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    return true;
+  });
+
+  filteredIds = filtered.map(d => d.id);
+  const gallery = document.getElementById("gallery");
+  gallery.innerHTML = "";
+
+  filtered.forEach(d => {
+    const card = document.createElement("div");
+    card.className = "card" + (selected.has(d.id) ? " selected" : "");
+    card.dataset.id = d.id;
+    card.innerHTML = `
+      <img src="${d.source_img}" loading="lazy">
+      <img src="${d.target_img}" loading="lazy">
+      <div class="card-info">
+        <div class="id">${d.id}</div>
+        <div class="simp">${d.simplified || "(no change)"}</div>
+        <div class="cat">${d.category}</div>
+      </div>
+    `;
+    card.addEventListener("click", () => toggleSelect(d.id));
+    gallery.appendChild(card);
+  });
+}
+
+function toggleSelect(id) {
+  if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  saveSelection();
+  // Update card class
+  document.querySelectorAll(`.card[data-id="${id}"]`).forEach(c =>
+    c.classList.toggle("selected")
+  );
+  renderPaper();
+}
+
+// ── Paper / Canvas (multi-page) ──
+const A4_CONTENT_H = 1123 - 48; // page height minus padding
+
+function renderPaper() {
+  const wrapper = document.getElementById("papers-wrapper");
+  const cols = parseInt(document.getElementById("col-count").value) || 3;
+  wrapper.innerHTML = "";
+
+  const items = allData.filter(d => selected.has(d.id));
+  document.getElementById("canvas-count").textContent = `Selected: ${items.length}`;
+
+  if (items.length === 0) return;
+
+  const rowsPerPage = 5;
+  const itemsPerPage = rowsPerPage * cols;
+
+  const totalPages = Math.ceil(items.length / itemsPerPage);
+
+  for (let p = 0; p < totalPages; p++) {
+    const page = document.createElement("div");
+    page.className = "paper-page";
+
+    const grid = document.createElement("div");
+    grid.className = "paper-grid";
+    grid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+
+    const pageItems = items.slice(p * itemsPerPage, (p + 1) * itemsPerPage);
+    pageItems.forEach(d => {
+      const div = document.createElement("div");
+      div.className = "paper-item";
+      div.innerHTML = `
+        <div class="pair">
+          <div class="img-wrapper">
+            <span class="img-label">Source</span>
+            <img src="${d.source_img}">
+          </div>
+          <div class="img-wrapper">
+            <span class="img-label">Edited</span>
+            <img src="${d.target_img}">
+          </div>
+        </div>
+        <div class="prompt-line">${d.simplified || d.editing_prompt}</div>
+      `;
+      grid.appendChild(div);
+    });
+
+    page.appendChild(grid);
+
+    wrapper.appendChild(page);
+  }
+}
+
+// ── Toolbar events ──
+document.getElementById("filter-cat").addEventListener("change", render);
+document.getElementById("search").addEventListener("input", render);
+document.getElementById("col-count").addEventListener("change", renderPaper);
+
+document.getElementById("btn-clear").addEventListener("click", () => {
+  selected.clear();
+  saveSelection();
+  render();
+  renderPaper();
+});
+
+document.getElementById("btn-select-all").addEventListener("click", () => {
+  filteredIds.forEach(id => selected.add(id));
+  saveSelection();
+  render();
+  renderPaper();
+});
+
+// ── Load libraries ──
+function loadScript(url) {
+  return new Promise((resolve, reject) => {
+    if (document.querySelector(`script[src="${url}"]`)) return resolve();
+    const s = document.createElement("script");
+    s.src = url; s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+}
+async function loadLibs() {
+  await loadScript("https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js");
+}
+
+async function capturePages() {
+  await loadLibs();
+  showToast("Preparing export…");
+
+  // Fetch all paper images as data URLs so html2canvas doesn't need to re-request them
+  const imgs = [...document.querySelectorAll(".paper-page img")];
+  const origSrcs = imgs.map(img => img.src);
+
+  await Promise.all(imgs.map(async (img, i) => {
+    try {
+      const resp = await fetch(origSrcs[i]);
+      const blob = await resp.blob();
+      const dataUrl = await new Promise(r => {
+        const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob);
+      });
+      await new Promise(r => { img.onload = r; img.onerror = r; img.src = dataUrl; });
+    } catch(e) { /* keep original on error */ }
+  }));
+
+  const pages = document.querySelectorAll(".paper-page");
+  const canvases = [];
+  for (const page of pages) {
+    const c = await html2canvas(page, { useCORS: false, scale: 8, backgroundColor: "#ffffff" });
+    canvases.push(c);
+  }
+
+  // Restore original srcs
+  imgs.forEach((img, i) => { img.src = origSrcs[i]; });
+
+  return canvases;
+}
+
+// Crop canvas to the minimum bounding rectangle of non-white pixels
+function trimCanvas(canvas) {
+  const ctx = canvas.getContext("2d");
+  const { width, height } = canvas;
+  const data = ctx.getImageData(0, 0, width, height).data;
+
+  let top = height, bottom = 0, left = width, right = 0;
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const i = (y * width + x) * 4;
+      const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+      // Non-white and non-transparent pixel
+      if (a > 10 && !(r > 245 && g > 245 && b > 245)) {
+        if (y < top) top = y;
+        if (y > bottom) bottom = y;
+        if (x < left) left = x;
+        if (x > right) right = x;
+      }
+    }
+  }
+
+  // Add small padding (8px each side)
+  const pad = 8;
+  top = Math.max(0, top - pad);
+  bottom = Math.min(height - 1, bottom + pad);
+  left = Math.max(0, left - pad);
+  right = Math.min(width - 1, right + pad);
+
+  const w = right - left + 1;
+  const h = bottom - top + 1;
+  if (w <= 0 || h <= 0) return canvas; // nothing to trim
+
+  const cropped = document.createElement("canvas");
+  cropped.width = w; cropped.height = h;
+  cropped.getContext("2d").putImageData(
+    ctx.getImageData(left, top, w, h), 0, 0
+  );
+  return cropped;
+}
+
+function canvasToBlob(canvas) {
+  return new Promise(resolve => {
+    canvas.toBlob(blob => resolve(blob), "image/png");
+  });
+}
+
+// Copy first page as image to clipboard
+document.getElementById("btn-copy").addEventListener("click", async () => {
+  try {
+    const canvases = await capturePages();
+    if (canvases.length === 0) return showToast("No pages to copy");
+    const blob = await canvasToBlob(canvases[0]);
+    await navigator.clipboard.write([
+      new ClipboardItem({ [blob.type]: blob })
+    ]);
+    showToast("Page 1 copied to clipboard!");
+  } catch (e) {
+    showToast("Copy failed: " + e.message);
+  }
+});
+
+// Download all pages as individual compressed JPEGs
+document.getElementById("btn-download").addEventListener("click", async () => {
+  try {
+    const canvases = await capturePages();
+    if (canvases.length === 0) return showToast("No pages to download");
+
+    for (let i = 0; i < canvases.length; i++) {
+      const blob = await canvasToBlob(trimCanvas(canvases[i]));
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = canvases.length === 1
+        ? "pie_bench_selection.png"
+        : `pie_bench_selection_page${i + 1}.png`;
+      a.click();
+      URL.revokeObjectURL(url);
+      // Small delay between downloads so browser doesn't block them
+      if (canvases.length > 1) await new Promise(r => setTimeout(r, 300));
+    }
+
+    showToast(`Downloaded ${canvases.length} image(s)!`);
+  } catch (e) {
+    showToast("Download failed: " + e.message);
+  }
+});
+
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  setTimeout(() => t.classList.remove("show"), 2000);
+}
+</script>
+</body>
+</html>

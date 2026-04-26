@@ -279,6 +279,12 @@ def compute_attention_mask_for_scale(
     source_image_np: Optional[np.ndarray] = None,
     ref_mask: Optional[np.ndarray] = None,
     dynamic_max_iters: int = 20,
+    cv_min: float = 0.0,
+    cv_max: float = 1.0,
+    k_min: float = 0.2,
+    k_max: float = 0.5,
+    absolute_high: float = 0.7,
+    absolute_low: float = 0.3,
 ) -> Optional[np.ndarray]:
     """
     計算指定 scale 的 attention-based 空間遮罩。
@@ -368,6 +374,12 @@ def compute_attention_mask_for_scale(
         fallback_percentile=threshold_percentile,
         source_image=source_image_np,
         attn_stack=attn_stack.numpy(),
+        cv_min=cv_min,
+        cv_max=cv_max,
+        k_min=k_min,
+        k_max=k_max,
+        absolute_high=absolute_high,
+        absolute_low=absolute_low,
     )
 
     # 二值化
@@ -607,6 +619,12 @@ def collect_attention_text_masks(
     source_image_np: Optional[np.ndarray] = None,
     ref_mask: Optional[np.ndarray] = None,
     dynamic_max_iters: int = 20,
+    cv_min: float = 0.0,
+    cv_max: float = 1.0,
+    k_min: float = 0.2,
+    k_max: float = 0.5,
+    absolute_high: float = 0.7,
+    absolute_low: float = 0.3,
 ) -> Dict[int, np.ndarray]:
     """
     收集各 scale 的 attention mask，不存入 storage。
@@ -646,6 +664,12 @@ def collect_attention_text_masks(
             source_image_np=source_image_np,
             ref_mask=ref_mask,
             dynamic_max_iters=dynamic_max_iters,
+            cv_min=cv_min,
+            cv_max=cv_max,
+            k_min=k_min,
+            k_max=k_max,
+            absolute_high=absolute_high,
+            absolute_low=absolute_low,
         )
 
         if text_mask is not None:
@@ -1640,11 +1664,15 @@ if __name__ == '__main__':
     parser.add_argument('--save_attn_vis', type=int, default=1, choices=[0, 1])
     parser.add_argument('--use_normalized_attn', type=int, default=0, choices=[0, 1],
                         help='使用 z-score normalized threshold 取代固定 percentile（0=停用，1=啟用）')
-    parser.add_argument('--threshold_method', type=int, default=1, choices=list(range(1, 14)),
+    parser.add_argument('--threshold_method', type=int, default=1, choices=list(range(1, 15)),
                         help='閾值方法：1=固定percentile 2=dynamic ternary 3=Otsu 4=FFT+Otsu '
                              '5=SpectralEnergy 6=EdgeCoherence 7=GMM 8=Composite '
                              '9=IPR 10=Entropy 11=BlockConsensus 12=Kneedle '
-                             '13=MetaAdaptive。預設：1')
+                             '13=MetaAdaptive 14=Absolute(norm>high/<low)。預設：1')
+    parser.add_argument('--absolute_high', type=float, default=0.7,
+                        help='Method 14 focus 閾值（正規化後 >= absolute_high 為 focus）。預設：0.7')
+    parser.add_argument('--absolute_low', type=float, default=0.3,
+                        help='Method 14 preserve 閾值（正規化後 < absolute_low 為 preserve）。預設：0.3')
     parser.add_argument('--phase17_fallback_replace_scales', type=int, default=4,
                         help='Single-focus fallback（只有 target focus）時，'
                              'Phase 1.7 以 source gen token 替換前幾個 scale（0=停用）。預設：4')

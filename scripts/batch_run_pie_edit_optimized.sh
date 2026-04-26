@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-# batch_run_pie_edit.sh
+# batch_run_pie_edit_optimized.sh
 #
 # 目的：
 #   批量跑 extracted_pie_bench，模型只載入一次。
@@ -9,7 +9,7 @@
 #   2) 取 prompt 差異詞作為 source_focus_words / target_focus_words
 #
 # 執行：
-#   bash scripts/batch_run_pie_edit.sh
+#   bash scripts/batch_run_pie_edit_optimized.sh
 # ==============================================================================
 
 # ── 模型設定（與 infer_p2p_edit.sh 相同）──
@@ -40,7 +40,7 @@ attn_block_end=-1
 attn_batch_idx=0
 p2p_token_replace_prob=0.0
 use_cumulative_prob_mask=1
-save_attn_vis=1
+save_attn_vis=0
 use_normalized_attn=0
 use_last_scale_mask=0
 last_scale_majority_threshold=0.45
@@ -60,12 +60,7 @@ seed=1
 # 11 = Block Consensus Voting（逐 block Otsu 投票 → 面積中位數）
 # 12 = Kneedle / Elbow Detection（排序曲線最大離差點）
 # 13 = Meta-Adaptive（CV 變異係數 → 動態 k 倍率門檻）
-# 14 = Absolute（正規化到 [0,1] 後：>= absolute_high 為 focus，< absolute_low 為 preserve）
 threshold_method=13
-
-# Method 14 絕對閾值（僅 threshold_method=14 時生效）
-absolute_high=0.7
-absolute_low=0.3
 
 # Single-focus fallback（只有 target focus，無 source focus）時，
 # Phase 1.7 以 source gen token 替換前幾個 scale，讓 attention 擷取時有結構參考
@@ -79,7 +74,7 @@ dynamic_threshold_iters=20
 
 # ── 批量資料設定 ──
 bench_dir="./outputs/outputs_loop_exp/PIE-Bench_v1-20260314T125823Z-3-001/PIE-Bench_v1"
-output_dir="./outputs/outputs_loop_exp/pie_bench_correctedResults_threshold_method${threshold_method}_CV0.5-1.0_k0.2-0.5"
+output_dir="./outputs/outputs_loop_exp/eval_pie_ours/output/pie_bench_correctedResults_threshold_method${threshold_method}_CV0.5-1.0_k0.2-0.5_optimized"
 
 # 可選：只跑特定 category，逗號分隔；留空表示全部 0~9 大任務
 categories=""
@@ -96,7 +91,7 @@ echo " bench_dir  : ${bench_dir}"
 echo " output_dir : ${output_dir}"
 echo "================================================================"
 
-python3 tools/batch_run_pie_edit.py \
+python3 tools/batch_run_pie_edit_optimized.py \
   --cfg ${cfg} \
   --tau ${tau} \
   --pn ${pn} \
@@ -128,13 +123,11 @@ python3 tools/batch_run_pie_edit.py \
   --use_normalized_attn ${use_normalized_attn} \
   --use_last_scale_mask ${use_last_scale_mask} \
   --last_scale_majority_threshold ${last_scale_majority_threshold} \
-  --use_dynamic_threshold ${use_dynamic_threshold} \
-  --dynamic_threshold_iters ${dynamic_threshold_iters} \
   --bench_dir "${bench_dir}" \
   --output_dir "${output_dir}" \
   ${categories:+--categories "${categories}"} \
   --max_per_cat ${max_per_cat} \
   --skip_existing ${skip_existing} \
-  --seed ${seed} \
-  --absolute_high ${absolute_high} \
-  --absolute_low ${absolute_low}
+  --seed ${seed}\
+  # --use_dynamic_threshold ${use_dynamic_threshold} \
+  # --dynamic_threshold_iters ${dynamic_threshold_iters} \

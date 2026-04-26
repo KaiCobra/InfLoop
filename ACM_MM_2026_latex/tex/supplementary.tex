@@ -1,33 +1,199 @@
-% \section{Algorithm Details}
-% \label{sec:supp_algorithms}
+\section{Algorithm Details}
+\label{sec:supp_algorithms}
 
-% \subsection{Adaptive Mask Thresholding}
-% \label{sec:supp_adaptive_threshold}
+Due to space constraints in the main text, we provide the complete algorithmic procedures and additional analysis in this section. All notation follows the definitions in Sec.~3 of the main text.
 
-% Rather than using a fixed percentile for mask binarization, we adaptively adjust the percentile parameter $p$ based on the spatial distribution of attention scores in each image. The intuition is straightforward: when many spatial positions exhibit high attention (i.e., the editing region is large), a higher percentile is needed to produce a selective mask; when attention is concentrated on few positions, a lower percentile avoids over-masking.
+\subsection{Adaptive Mask Thresholding}
+\label{sec:supp_adaptive_threshold}
 
-% Concretely, we first compute the hot-spot ratio $\rho$, defined as the fraction of spatial positions in $\hat{a}_k$ that exceed a base threshold $\tau_{\mathrm{base}}$:
-% \begin{equation}
-%     \rho = \frac{|\{i : \hat{a}_k[i] > \tau_{\mathrm{base}}\}|}{N_v}
-% \end{equation}
-% The percentile parameter $p$ is then obtained via linear mapping over a predefined range $[p_{\min}, p_{\max}]$:
-% \begin{equation}
-%     p = p_{\min} + \rho \cdot (p_{\max} - p_{\min})
-% \end{equation}
-% In our experiments, we set $\tau_{\mathrm{base}}$ to the median of $\hat{a}_k$, $p_{\min} = 0.7$, and $p_{\max} = 0.9$. The final threshold is $\tau_k = \mathrm{Percentile}(\hat{a}_k, p)$. The procedure is given in Algorithm~\ref{alg:adaptive_threshold} below.
+As described in the main text (Sec.~3.3), the filtered map $\hat{a}_k$ is binarized into two complementary masks via adaptive thresholding. Here we detail the concrete mechanism that determines the thresholds $\tau_k$ and $\tau_k^{\mathrm{low}}$.
 
-% \input{equations/algor1}
+The core observation is that the \emph{Coefficient of Variation} (CV) of the filtered attention map $\hat{a}_k$ serves as a reliable proxy for attention concentration.
+In the context of attention maps---which are typically sparse, with most values near zero and a small number of strong peaks---a high CV indicates that attention energy is concentrated on a few spatial positions (a compact editing region), while a low CV indicates that many spatial positions exhibit high attention scores (a diffuse or large editing region).
+We exploit this signal to adaptively calibrate $p$ per image based on the attention distribution, as stated in the main text.
 
-% \subsection{Complete Editing Pipeline}
-% \label{sec:supp_pipeline}
+Formally, given the IQR-filtered attention $\hat{a}_k \in \mathbb{R}^{N_v}$ (Eq.~(6) in the main text), we compute:
+\begin{equation}
+    \mu = \mathrm{mean}(\hat{a}_k),\quad
+    \sigma = \mathrm{std}(\hat{a}_k),\quad
+    \mathit{CV} = \frac{\sigma}{\mu + \varepsilon}
+\end{equation}
+where $\varepsilon = 10^{-8}$ is a numerical stability constant.
+We then determine an adaptive multiplier $\kappa$ via \emph{inverse} linear interpolation of $\mathit{CV}$: a higher CV (more concentrated attention) yields a \emph{lower} $\kappa$, and vice versa:
+\begin{equation}
+    \kappa = \mathrm{clamp}\!\left(
+        \kappa_{\max} - (\mathit{CV} - \mathit{CV}_{\min}) \cdot \frac{\kappa_{\max} - \kappa_{\min}}{\mathit{CV}_{\max} - \mathit{CV}_{\min}},\;
+        \kappa_{\min},\; \kappa_{\max}
+    \right)
+\end{equation}
+The two adaptive thresholds are then derived symmetrically around the mean:
+\begin{equation}
+\begin{aligned}
+    \tau_k &= \mu + \kappa \cdot \sigma, \\
+    \tau_k^{\mathrm{low}} &= \mu - \kappa \cdot \sigma.
+\end{aligned}
+\label{eq:adaptive_thresholds}
+\end{equation}
+Once $\tau_k$ is computed, the effective percentile $p$ is precisely defined as
+\begin{equation}
+    p = \frac{|\{i : \hat{a}_k[i] < \tau_k\}|}{N_v},
+    \label{eq:effective_p}
+\end{equation}
+i.e., $\tau_k$ is exactly the $p$-th percentile of $\hat{a}_k$, and $\tau_k^{\mathrm{low}}$ is exactly its $(1{-}p)$-th percentile. This links the $\sigma$-multiplier $\kappa$ to the percentile notation $p$ used in the main text (Sec.~3.3).
+Since $p$ increases monotonically with $\kappa$, and $\kappa$ decreases monotonically with CV, the adaptive scheme directly controls mask selectivity per image.
 
-% Algorithm~\ref{alg:editing} gives the full three-phase procedure corresponding to Section~4.3 in the main text.
+This yields three spatial regions (Eq.~\eqref{eq:masks}):
+\begin{itemize}
+    \item \textbf{Focus region} ($\hat{a}_k \ge \tau_k$, top $1{-}p$ fraction): $M_k^{\mathrm{f}} = \mathbf{1}[\hat{a}_k \ge \tau_k]$. High-attention positions corresponding to editing-relevant words; these are \textit{not} overwritten by source tokens.
+    \item \textbf{Preserve region} ($\hat{a}_k \le \tau_k^{\mathrm{low}}$, bottom $1{-}p$ fraction): $M_{k,s}^{\mathrm{p}} = \mathbf{1}[\hat{a}_k \le \tau_k^{\mathrm{low}}]$. Pure background positions that are \textit{hard-locked} to source tokens from Phase~2 onward (see below), regardless of the target stream's attention.
+    \item \textbf{Ambiguous region} ($\tau_k^{\mathrm{low}} < \hat{a}_k < \tau_k$, middle $2p{-}1$ fraction): positions that belong to neither mask. Their assignment is determined by the dual-stream mask union in Phase~3 (Sec.~\ref{sec:supp_pipeline}): any position not claimed by either the source or target focus mask automatically receives source tokens via the replacement mask $M_k^{\mathrm{rep}} = \neg(M_{k,s}^{\mathrm{f}} \cup M_{k,t}^{\mathrm{f}})$.
+\end{itemize}
 
-% \input{equations/algor2}
+Concretely, when many spatial positions exhibit high attention scores (low CV, diffuse attention), $\kappa$ is large, raising the effective $p$ and producing a more selective focus mask that isolates only the most relevant tokens from the broadly active region.
+Conversely, when attention is concentrated on few positions (high CV), $\kappa$ is small, lowering $p$ to avoid over-masking---a permissive threshold that fully captures the compact editing region without discarding its periphery.
 
-% \subsection{Scale-Level Replacement Analysis}
-% \label{sec:supp_shape_diff}
+\noindent\textbf{Preserve as a hard constraint.}
+While all non-focus positions receive source tokens by default through the replacement mask $M_k^{\mathrm{rep}} = \neg(M_{k,s}^{\mathrm{f}} \cup M_{k,t}^{\mathrm{f}})$, the preserve mask provides an additional, stronger guarantee: preserve positions must receive source tokens \emph{regardless of what the target stream attends to}. This is enforced in two stages.
+First, during Phase~2 (Algorithm~\ref{alg:editing}, line~11), positions where $M_{k,s}^{\mathrm{p}}{=}1$ are locked to source tokens $r_k^s$ before the target-conditioned generation, preventing the target model from attending to or modifying these regions.
+Second, after the target focus mask $M_{k,t}^{\mathrm{f}}$ is extracted, any overlap with the preserve region is explicitly cancelled:
+\begin{equation}
+    M_{k,t}^{\mathrm{f}} \gets M_{k,t}^{\mathrm{f}} \;\wedge\; \neg\, M_{k,s}^{\mathrm{p}}
+    \label{eq:preserve_override}
+\end{equation}
+(Algorithm~\ref{alg:editing}, line~15). This is the concrete enforcement of the background anchoring described in the main text (Sec.~3.4): even if the target attention inadvertently covers part of the background, those positions are removed from the editing region before token composition, ensuring that preserve positions always receive source tokens.
 
-% \input{imgs/shape_diff}
+In all experiments, we set $\mathit{CV}_{\min}{=}0.5$, $\mathit{CV}_{\max}{=}1.5$, $\kappa_{\min}{=}1.5$, and $\kappa_{\max}{=}4.5$. These values span the empirical CV range observed across all 700 PIE-Bench attention maps and ensure that $\tau_k$ lies between $1.5\sigma$ and $4.5\sigma$ above the mean---consistent with standard statistical outlier-detection practice.
+The scheme requires only two scalar statistics ($\mu$, $\sigma$) and no external inputs such as reference masks or source images, consistent with the training-free, tuning-free design of our framework.
+The full procedure is given in Algorithm~\ref{alg:adaptive_threshold}.
 
-% Fig.~\ref{fig:shape_diff_a} shows the effect of varying the number of shared scales $N$: few shared scales allow editing but degrade the background, while many shared scales preserve the background but lock the global layout. Fig.~\ref{fig:shape_diff_b} further illustrates VAR's coarse-to-fine generation, where early scales commit to the global structure, limiting the effectiveness of fixed-scale replacement strategies. Our attention-mask approach resolves this tension by selectively replacing only background tokens at every scale.
+\input{equations/algor1}
+
+\subsection{Complete Editing Pipeline}
+\label{sec:supp_pipeline}
+
+Algorithm~\ref{alg:editing} gives the full three-phase procedure corresponding to Sec.~3.4 in the main text.
+The focus word sets $\mathcal{F}_s$ and $\mathcal{F}_t$ are obtained by differencing the source and target prompts $P_s$ and $P_t$: token positions where the two prompts differ are identified, and the corresponding source-side and target-side tokens form $\mathcal{F}_s$ and $\mathcal{F}_t$, respectively (see Sec.~3.3 of the main text).
+
+\input{equations/algor2}
+
+Fig.~\ref{fig:AttentionMaskDemo} provides a step-by-step visual walkthrough of Algorithm~\ref{alg:editing}.
+During Phase~1, the cross-attention maps are aggregated over IQR-filtered transformer blocks at each generation scale, then thresholded into a focus mask and a preserve mask via the adaptive CV-based scheme (Algorithm~\ref{alg:adaptive_threshold}).
+During Phase~2, the preserve mask acts as a hard anchor: positions marked as preserve are locked to source tokens, preventing the target generation from attending to or modifying these regions. Only the focus threshold of the target stream is used; the target-side preserve threshold is unnecessary because background anchoring is determined entirely by the source-side preserve mask $M_{k,s}^{\mathrm{p}}$. If the resulting target focus mask overlaps with any preserve position, those positions are explicitly removed from the target focus (Algorithm~\ref{alg:editing}, line~15).
+During Phase~3, the dual-stream focus masks are combined into a replacement mask that confines token replacement to the semantically relevant region at each scale. Positions not claimed by either focus mask---including both the explicitly preserved background and the intermediate ambiguous positions---receive source tokens, thereby preserving all unedited content.
+    
+\input{imgs/AttentionMaskDemo}
+
+\subsection{Scale-Level Replacement Analysis}
+\label{sec:supp_shape_diff}
+
+\input{imgs/shape_diff}
+
+As discussed in the ablation study (Sec.~4.3), increasing the number of shared scales $N$ progressively improves background preservation, but the gains saturate because scales beyond $N$ generate independently with no source reference. Fig.~\ref{fig:shape_diff_a} illustrates this visually: few shared scales allow editing but degrade the background, while many shared scales preserve the background but lock the global layout. Fig.~\ref{fig:shape_diff_b} further demonstrates VAR's coarse-to-fine generation, where early scales commit to the global structure, limiting the effectiveness of fixed-scale replacement strategies. Our attention-mask approach resolves this tension by selectively replacing only background tokens at every scale, achieving both faithful editing and preservation simultaneously.
+
+\section{Implementation Details}
+\label{sec:supp_impl}
+
+To facilitate reproducibility, we provide the complete hyperparameter settings and hardware specifications used in all experiments. Table~\ref{tab:supp_hyperparams} summarizes the key configuration.
+
+\begin{table}[h]
+\centering
+\caption{Complete hyperparameter settings.}
+\label{tab:supp_hyperparams}
+\small
+\begin{tabular}{@{}ll@{}}
+\toprule
+\textbf{Component} & \textbf{Setting} \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{Model Architecture}} \\
+Backbone & Infinity-2B (2B parameters) \\
+Tokenizer & BSQ-VAE ($d{=}32$) \\
+Text encoder & Flan-T5-XL \\
+Transformer blocks & 32 \\
+Generation scales $S$ & 13 ($1{\times}1$ to $64{\times}64$) \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{Generation}} \\
+CFG scale & 4.0 \\
+Temperature $\tau$ & 0.5 \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{Editing Pipeline}} \\
+Full-replace scales $N$ & 2 \\
+IQR-filtered blocks & 2--31 (of 0--31) \\
+$\mathit{CV}_{\min}$, $\mathit{CV}_{\max}$ & 0.5, 1.5 \\
+$\kappa_{\min}$, $\kappa_{\max}$ & 1.5, 4.5 \\
+\midrule
+\multicolumn{2}{@{}l}{\textit{Hardware \& Software}} \\
+GPU & NVIDIA RTX 5090 ($\times 1$) \\
+Inference time & ${\sim}$2.5\,s per image \\
+Framework & PyTorch \\
+Attention acceleration & Flash Attention \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent\textbf{IQR block filtering.}
+Blocks 0--1 are unconditionally excluded because they consistently exhibit the global attention effect described in Sec.~3.3 of the main text. Among the remaining blocks 2--31, IQR filtering typically discards 10--20\% per scale, retaining only blocks whose attention maps reflect semantic content rather than positional bias.
+
+\noindent\textbf{Adaptive thresholding defaults.}
+The CV-based thresholding operates automatically with no per-image tuning. All four parameters ($\mathit{CV}_{\min}$, $\mathit{CV}_{\max}$, $\kappa_{\min}$, $\kappa_{\max}$) are fixed throughout all experiments and editing categories.
+
+\noindent\textbf{Baseline reproduction.}
+All baseline results are obtained using officially released code under default settings. Diffusion-based and flow-based baselines operate at their native resolution (typically 512$\times$512), while our method generates at the Infinity model's default resolution ($1024{\times}1024$). AREdit results are cited directly from the original paper as no official implementation has been released.
+
+\noindent\textbf{Evaluation resolution.}
+Although our method generates images at $1024{\times}1024$, all quantitative metrics reported in this paper are computed at $512{\times}512$ resolution, following the official PIE-Bench evaluation protocol. Specifically, both the edited output and the ground-truth source image are resized to $512{\times}512$ before computing PSNR, SSIM, LPIPS, Structure Distance, and CLIP similarities. This ensures a fair, resolution-matched comparison against all baselines. We note that this downsampling may slightly disadvantage higher-resolution methods, as resizing from $1024{\times}1024$ to $512{\times}512$ can introduce interpolation artifacts not present in methods that natively operate at $512{\times}512$; nonetheless, we adopt this protocol to maintain strict comparability.
+
+
+\section{Additional Experimental Results}
+\label{sec:supp_results}
+
+\subsection{Additional Qualitative Comparisons}
+\label{sec:supp_qualitative}
+
+To demonstrate that our method generalizes across diverse editing scenarios beyond the cases shown in the main text, we present 42 additional qualitative comparisons on PIE-Bench in Figs.~\ref{fig:qualSupp1}--\ref{fig:qualSupp6}. These examples collectively cover all ten PIE-Bench editing categories: object replacement, object addition, object removal, attribute modification, color change, material change, background change, style transfer, pose change, and content change. Each figure follows the same column layout as the qualitative comparison in the main text: the source image (leftmost), results from the eight baseline methods, and our result (rightmost column). Editing instructions are annotated below each row.
+
+We deliberately include examples spanning a wide range of difficulty levels, from straightforward color changes to complex multi-attribute edits. On challenging cases such as object removal (Fig.~\ref{fig:qualSupp1}, Row~6) and global style transfer (Fig.~\ref{fig:qualSupp3}, Row~7), our method maintains coherent results while several baselines either fail to complete the edit or introduce unintended artifacts in unrelated regions. Background-centric edits are particularly well-represented in Fig.~\ref{fig:qualSupp4}, where the subject must remain entirely unaltered — a scenario that directly validates the effectiveness of our attention-mask-based foreground--background decomposition.
+
+
+
+\subsection{Per-Category Quantitative Analysis}
+\label{sec:supp_category}
+
+Table~\ref{tab:category_scores} reports the per-category breakdown of our method on all ten PIE-Bench editing categories.
+All metrics are computed at $512{\times}512$ following the standard PIE-Bench evaluation protocol (see Sec.~\ref{sec:supp_impl}), ensuring comparability with the baselines in the main text.
+Background preservation metrics (PSNR, SSIM, LPIPS, StructDist) are naturally higher for categories that involve localized edits with little structural change, such as Change Material and Change Background, where the subject remains spatially intact.
+Categories requiring larger geometric or semantic changes — Change Pose and Change Object — show lower background preservation scores, consistent with the inherent difficulty of isolating edits in those scenarios.
+Edit quality (CLIPe) is highest for Change Style, reflecting that global stylistic edits are well-captured by the CLIP embedding of the edited region.
+Delete Object yields the lowest CLIPe due to the absence of a concrete target object for the CLIP similarity measurement.
+
+\input{tabs/categoryScore}
+
+\subsection{Failure Case Analysis}
+\label{sec:supp_failure}
+
+As discussed in the Limitations paragraph of the main text, our method inherits the structural constraints of the VAR generation paradigm. The primary failure mode arises from VAR's inherent coarse-to-fine layout commitment: since VAR inherently commits to global spatial structure at the earliest scales (approximately $k \leq 4$, regardless of the editing methodology), edits that require a fundamentally different spatial configuration cannot be realized. When the target prompt demands a drastic geometric change (e.g., completely reorienting a subject's body pose or drastically altering the object's aspect ratio), the coarse-scale tokens copied from the source conflict with the desired edit, and no amount of fine-scale token replacement can correct the committed global layout. Note that moderate adjustments (e.g., sitting$\to$standing, as shown in Fig.~\ref{fig:qualSupp5} Row~6) remain feasible; the limitation arises only for extreme structural changes.
+
+Fig.~\ref{fig:failure_cases_supp} visualizes this collapse: the red-bordered frames reveal that the VAR model commits to a global layout as early as scales $k{=}1$--$2$ that is incompatible with the target prompt. Once this commitment is made, no subsequent fine-scale generation can redirect the edit, resulting in an edited image that fails to realize the intended geometric change.
+
+\input{imgs/failure_cases_supp}
+
+This failure mode is intrinsic to VAR's coarse-to-fine generation paradigm and represents an important direction for future work.
+
+\subsection{Text-to-Image Editing Results}
+\label{sec:supp_t2i_editing}
+
+As noted in Sec.~3.4 of the main text, our framework naturally extends to a text-to-image (T2I) editing mode by setting $I_s = \varnothing$, i.e., $I_e = f(P_s, P_t)$, where both the source and target images are generated purely from prompts without any real image input. This mode targets modifying \emph{generated} content rather than editing an existing photograph, and is directly analogous to the Prompt-to-Prompt paradigm in the diffusion literature.
+
+Since our attention-based masking mechanism operates on cross-attention maps between the prompt tokens and the visual tokens — which are produced regardless of whether the source image is real or generated — the entire mask construction pipeline (IQR filtering, adaptive thresholding, dual-stream extraction) requires \emph{no modification} for the T2I setting. The only difference is that Phase~1 generates the source image from $P_s$ rather than encoding a given photograph.
+
+Figs.~\ref{fig:p2p_1}--\ref{fig:p2p_3} present 45 T2I editing examples spanning diverse editing types: color changes, material and style transfers, object replacement, attribute modification, expression and pose changes, and background replacement. Several observations are noteworthy:
+
+\begin{itemize}
+    \item \textbf{Fine-grained semantic control}: The method successfully handles nuanced edits such as gaze direction changes (eyes looking down$\to$forward), facial expression modification (calm$\to$laughing), and subtle material changes ($+$wooden, $+$bronze), indicating that the cross-attention maps in the VAR transformer carry sufficient spatial semantics for precise localization.
+    \item \textbf{Global vs.\ local edits}: Both globally affecting edits (style transfers such as $+$cartoon, $+$origami) and spatially localized edits (color changes on specific objects) are handled by the same pipeline without mode switching, demonstrating the versatility of the attention-mask formulation.
+    \item \textbf{Background preservation}: Even without a real source image to anchor, the T2I mode produces edits that maintain the unedited regions of the generated source image, confirming that the discrete token replacement mechanism provides a strong structural prior.
+\end{itemize}
+
+These results validate that our framework is not specific to real-image editing and can serve as a general-purpose prompt-guided editing tool for VAR-based generation.
+
+\input{imgs/qualSupp}
+\input{imgs/p2pqualSupp}

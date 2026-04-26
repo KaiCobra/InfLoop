@@ -580,7 +580,8 @@ class Infinity(nn.Module):
             cond_BD_or_gss = self.shared_ada_lin(cond_BD.float()).float().contiguous()
         accu_BChw, cur_L, ret = None, 0, []  # current length, list of reconstructed images
         idx_Bl_list, idx_Bld_list = [], []
-        
+        self.summed_codes_list_for_vis = []  # 每個 scale 結束後的 summed_codes 快照
+
         # Rollback mechanism: save state for potential rollback
         rollback_schedule = rollback_schedule or {}  # {scale_idx: num_retries}
         scale_states = {}  # {scale_idx: (last_stage, accu_BChw, summed_codes, cur_L)}
@@ -918,6 +919,9 @@ class Infinity(nn.Module):
                         )
                     else:
                         summed_codes += F.interpolate(codes, size=vae_scale_schedule[-1], mode=vae.quantizer.z_interplote_up)
+                    # 儲存當前 scale 的 summed_codes 快照（用於逐 scale 視覺化）
+                    if isinstance(summed_codes, torch.Tensor):
+                        self.summed_codes_list_for_vis.append(summed_codes[:1].detach().clone().cpu())
                     last_stage = F.interpolate(summed_codes, size=vae_scale_schedule[si+1], mode=vae.quantizer.z_interplote_up) # [B, d, 1, h, w] or [B, d, 1, 2h, 2w]
                     last_stage = last_stage.squeeze(-3) # [B, d, h, w] or [B, d, 2h, 2w]
                     if self.apply_spatial_patchify: # patchify operation
@@ -926,6 +930,9 @@ class Infinity(nn.Module):
                     last_stage = torch.permute(last_stage, [0,2,1]) # [B, h*w, d] or [B, h*w, 4d]
                 else:
                     summed_codes += codes
+                    # 最後一個 scale 也儲存快照
+                    if isinstance(summed_codes, torch.Tensor):
+                        self.summed_codes_list_for_vis.append(summed_codes[:1].detach().clone().cpu())
             else:
                 if si < gt_leak:
                     idx_Bl = gt_ls_Bl[si]
