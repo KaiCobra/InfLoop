@@ -241,16 +241,87 @@ def apply_learned_v_A_to_text_features(
     return out
 
 
+def apply_v_B_with_face_swap(
+    text_features: torch.Tensor,    # [1, L, 2048]
+    token_indices: List[int],
+    v_B: torch.Tensor,              # [k, 2048] 或 [2048]
+    e_A_512: torch.Tensor,          # [512]
+    e_B_512: torch.Tensor,          # [512]
+    lam_swap: float = 1.0,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """Phase 2 conditioning：在 v_B（B 圖 inversion 的 boy token embedding）上做 e_B → e_A 的 face swap。
+
+    對每個 subject token i：
+        v_target[i] = v_B[i] - lam_swap * proj(e_B → norm(v_B[i]))
+                            + lam_swap * proj(e_A → norm(v_B[i]))
+
+    proj 採用 face_swap_utils.project_512_to_2048_repeat4 + scale_to_target_norm，
+    對齊到 v_B 的 norm 後相減/相加。lam_swap=0 退化為純 v_B（無 swap），
+    lam_swap=1 為完整 swap。
+    """
+    if not token_indices:
+        return text_features.clone()
+    if e_A_512.shape != (512,):
+        raise ValueError(f"e_A_512 must be (512,), got {tuple(e_A_512.shape)}")
+    if e_B_512.shape != (512,):
+        raise ValueError(f"e_B_512 must be (512,), got {tuple(e_B_512.shape)}")
+
+    out = text_features.clone()
+    v_B_dev = v_B.to(out.dtype).to(out.device)
+
+    proj_a_unit = project_512_to_2048_repeat4(
+        e_A_512.to(out.dtype).to(out.device)
+    )
+    proj_b_unit = project_512_to_2048_repeat4(
+        e_B_512.to(out.dtype).to(out.device)
+    )
+
+    if v_B_dev.dim() == 1:
+        target_norm = float(v_B_dev.norm(p=2).item())
+        proj_a_s = scale_to_target_norm(proj_a_unit, target_norm)
+        proj_b_s = scale_to_target_norm(proj_b_unit, target_norm)
+        new_vec = v_B_dev + lam_swap * (proj_a_s - proj_b_s)
+        for idx in token_indices:
+            if verbose:
+                print(
+                    f"    [v_B-swap] token[{idx}] v_B_norm={target_norm:.3f} "
+                    f"lam_swap={lam_swap:.3f} new_norm={float(new_vec.norm(p=2).item()):.3f}"
+                )
+            out[0, idx, :] = new_vec
+    else:
+        if v_B_dev.shape[0] != len(token_indices):
+            raise ValueError(
+                f"v_B.shape[0]={v_B_dev.shape[0]} != len(token_indices)={len(token_indices)}"
+            )
+        for k, idx in enumerate(token_indices):
+            target_norm = float(v_B_dev[k].norm(p=2).item())
+            proj_a_s = scale_to_target_norm(proj_a_unit, target_norm)
+            proj_b_s = scale_to_target_norm(proj_b_unit, target_norm)
+            new_vec = v_B_dev[k] + lam_swap * (proj_a_s - proj_b_s)
+            if verbose:
+                print(
+                    f"    [v_B-swap] token[{idx}] v_B_norm={target_norm:.3f} "
+                    f"lam_swap={lam_swap:.3f} new_norm={float(new_vec.norm(p=2).item()):.3f}"
+                )
+            out[0, idx, :] = new_vec
+    return out
+
+
 def encode_prompt_with_face_op(
     text_tokenizer,
     text_encoder,
     prompt: str,
     face_emb_512: Optional[torch.Tensor] = None,
-    op_mode: Optional[str] = None,        # None / "subtract" / "replace" / "linear" / "learned"
+    op_mode: Optional[str] = None,        # None / "subtract" / "replace" / "linear" / "learned" / "v_B_swap"
     subject_token_indices: Optional[List[int]] = None,
     lam1: float = 0.0,
     lam2: float = 1.0,
     learned_v_A: Optional[torch.Tensor] = None,  # 僅當 op_mode="learned" 時使用
+    learned_v_B: Optional[torch.Tensor] = None,  # 僅當 op_mode="v_B_swap" 時使用
+    face_emb_e_A: Optional[torch.Tensor] = None, # 僅當 op_mode="v_B_swap" 時使用 (512-d)
+    face_emb_e_B: Optional[torch.Tensor] = None, # 僅當 op_mode="v_B_swap" 時使用 (512-d)
+    lam_swap: float = 1.0,                       # 僅當 op_mode="v_B_swap" 時使用
     verbose: bool = False,
 ) -> Tuple[torch.Tensor, List[int], torch.Tensor, int]:
     """encode_prompt 的延伸版：在 trim padding 前對 subject token 做面部 embedding 操作。
@@ -258,11 +329,13 @@ def encode_prompt_with_face_op(
     Args:
         prompt:   原始 prompt 字串
         face_emb_512: 512-d AdaFace embedding；op_mode in {subtract, replace, linear} 時使用
-        op_mode:  "subtract" / "replace" / "linear" / "learned" / None
+        op_mode:  "subtract" / "replace" / "linear" / "learned" / "v_B_swap" / None
         subject_token_indices: 透過 find_focus_token_indices 預先算好的 token 索引
         lam1, lam2: 僅當 op_mode="linear" 時使用，組合成 lam1*orig + lam2*proj_scaled
         learned_v_A: 形狀 [k, 2048] 或 [2048]，op_mode="learned" 時使用；
                      直接寫入 subject token 位置（不做 repeat-4 / norm-scale）
+        learned_v_B / face_emb_e_A / face_emb_e_B / lam_swap:
+                     op_mode="v_B_swap" 時使用，做 v_B − proj(e_B) + proj(e_A) 注入
 
     Returns:
         (kv_compact, lens, cu_seqlens_k, Ltext) — 與 run_p2p_edit.encode_prompt 相同 shape
@@ -282,7 +355,25 @@ def encode_prompt_with_face_op(
         input_ids=input_ids, attention_mask=mask
     )["last_hidden_state"].float()                     # [1, 512, 2048]
 
-    if op_mode == "learned":
+    if op_mode == "v_B_swap":
+        if learned_v_B is None or face_emb_e_A is None or face_emb_e_B is None:
+            raise ValueError(
+                "op_mode='v_B_swap' requires learned_v_B, face_emb_e_A, face_emb_e_B"
+            )
+        if not subject_token_indices:
+            raise ValueError(
+                "subject_token_indices must be non-empty for op_mode='v_B_swap'"
+            )
+        text_features = apply_v_B_with_face_swap(
+            text_features=text_features,
+            token_indices=subject_token_indices,
+            v_B=learned_v_B,
+            e_A_512=face_emb_e_A,
+            e_B_512=face_emb_e_B,
+            lam_swap=lam_swap,
+            verbose=verbose,
+        )
+    elif op_mode == "learned":
         if learned_v_A is None:
             raise ValueError("op_mode='learned' requires learned_v_A")
         if not subject_token_indices:

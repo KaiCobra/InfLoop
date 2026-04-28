@@ -67,7 +67,8 @@ port=7860
 share=0                # 1=產生 *.gradio.live 公開連結
 adaface_url="http://127.0.0.1:8000"
 work_dir="./outputs/gradio_face_swap"
-identity_cache_dir="./weights/identities"   # learned 模式從這裡讀 v_A.pt；Train 按鈕也寫到這
+identity_cache_dir="./weights/identities"   # 保留：舊 v_A 流程（目前 UI 未使用）
+v_B_cache_dir="./weights/v_B_cache"         # learned 模式從這裡讀 v_B.pt；Train v_B 也寫到這
 debug_face_op=0
 
 mkdir -p "${work_dir}"
@@ -119,6 +120,7 @@ python3 tools/gradio_face_swap.py \
   --work_dir "${work_dir}" \
   --adaface_url "${adaface_url}" \
   --identity_cache_dir "${identity_cache_dir}" \
+  --v_B_cache_dir "${v_B_cache_dir}" \
   --default_prompt "${default_prompt}" \
   --default_subject "${default_subject}" \
   --debug_face_op ${debug_face_op}

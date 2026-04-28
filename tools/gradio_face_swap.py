@@ -50,6 +50,7 @@ from tools.face_swap_utils import (  # noqa: E402
     AdaFaceClient,
     encode_prompt_with_face_op,
 )
+import shutil  # noqa: E402
 from tools.optimize_face_token import (  # noqa: E402
     build_bsc,
     optimize_v_A,
@@ -103,6 +104,14 @@ class FaceSwapApp:
 
         os.makedirs(args.work_dir, exist_ok=True)
         os.makedirs(args.identity_cache_dir, exist_ok=True)
+        os.makedirs(args.v_B_cache_dir, exist_ok=True)
+
+    # ────────────────────────────────────────
+    # v_B 快取：(prompt, seed) → weights/v_B_cache/<hash>/v_B.pt
+    # ────────────────────────────────────────
+    def _v_B_cache_path(self, prompt_t: str, seed: int) -> str:
+        key = f"{abs(hash((prompt_t, int(seed)))) & 0xffffffff:08x}"
+        return os.path.join(self.args.v_B_cache_dir, key, "v_B.pt")
 
     # ────────────────────────────────────────
     # B 圖：依 (prompt, seed) 快取
@@ -160,7 +169,6 @@ class FaceSwapApp:
         subject_word: str,
         seed: int,
         phase2_mode: str,
-        identity_name: str,
     ):
         prompt_t = (prompt_t or "").strip()
         if not prompt_t:
@@ -168,13 +176,10 @@ class FaceSwapApp:
         subject_word = (subject_word or "").strip()
         if not subject_word:
             raise gr.Error("subject_word 不能為空（例如 'boy'）")
-        identity_name = (identity_name or "").strip()
 
-        # learned 模式不需要 source image（直接讀 cache）；linear 模式需要
-        if phase2_mode == "linear" and source_image is None:
-            raise gr.Error("Linear 模式需要上傳 source face image（用來算 e_A）")
-        if phase2_mode == "learned" and not identity_name:
-            raise gr.Error("Learned 模式需要 identity name 來定位 weights/identities/<name>/v_A.pt")
+        # 兩種模式都需要 source face image（用來算 e_A）
+        if source_image is None:
+            raise gr.Error("需要上傳 source face image（用來算 e_A）")
 
         with self.lock:
             t0 = time.time()
@@ -182,14 +187,12 @@ class FaceSwapApp:
             session_dir = os.path.join(self.args.work_dir, f"session_{session_id}")
             os.makedirs(session_dir, exist_ok=True)
 
-            # 1. 存上傳的 source face（若有）
-            src_path = None
-            if source_image is not None:
-                src_path = os.path.join(session_dir, "src.png")
-                source_image.convert("RGB").save(src_path)
+            # 1. 存上傳的 source face（用於算 e_A）
+            src_path = os.path.join(session_dir, "src.png")
+            source_image.convert("RGB").save(src_path)
 
             # 2. B 圖（依 prompt + seed cache）
-            print(f"[run] prompt='{prompt_t}' seed={seed} mode={phase2_mode} id={identity_name}")
+            print(f"[run] prompt='{prompt_t}' seed={seed} mode={phase2_mode}")
             b_path = self._generate_or_get_B(prompt_t, int(seed))
 
             # 3. e_B 永遠要算（phase 1.7 要做 subtract）
@@ -222,34 +225,45 @@ class FaceSwapApp:
                 verbose=bool(self.args.debug_face_op),
             )
 
+            # e_A 兩個 mode 都會用到
+            e_a = self.client.embed_files([src_path])[0]
+            e_a_norm = float(np.linalg.norm(e_a))
+            cos_ab = float(np.dot(e_a, e_b))
+            e_a_t = torch.from_numpy(e_a.astype(np.float32))
+
             extra_info = {}
             if phase2_mode == "learned":
-                v_A_path = os.path.join(self.args.identity_cache_dir, identity_name, "v_A.pt")
-                if not os.path.exists(v_A_path):
+                # v_B + face swap：v_target = v_B - lam_swap * proj(e_B) + lam_swap * proj(e_A)
+                v_B_path = self._v_B_cache_path(prompt_t, int(seed))
+                if not os.path.exists(v_B_path):
                     raise gr.Error(
-                        f"找不到 v_A.pt：{v_A_path}。請先按下 Train v_A 訓練，或改回 Linear 模式。"
+                        f"找不到 v_B.pt：{v_B_path}。請先在 Train v_B 區塊用相同 prompt + seed 訓練，"
+                        f"或改回 Linear 模式。"
                     )
-                blob = torch.load(v_A_path, map_location="cpu", weights_only=False)
-                v_A_tensor = blob["v_A"].float()
+                blob = torch.load(v_B_path, map_location="cpu", weights_only=False)
+                v_B_tensor = blob["v_B"].float()
                 kv_phase2 = encode_prompt_with_face_op(
                     self.text_tokenizer, self.text_encoder,
                     prompt=prompt_t,
-                    op_mode="learned",
+                    op_mode="v_B_swap",
                     subject_token_indices=subject_token_indices,
-                    learned_v_A=v_A_tensor,
+                    learned_v_B=v_B_tensor,
+                    face_emb_e_A=e_a_t,
+                    face_emb_e_B=e_b_t,
+                    lam_swap=float(lam2),
                     verbose=bool(self.args.debug_face_op),
                 )
                 extra_info.update({
-                    "phase2_mode": "learned",
-                    "v_A_path": v_A_path,
-                    "v_A_subject_word": blob.get("subject_word"),
-                    "v_A_prompt_t": blob.get("prompt_t"),
+                    "phase2_mode": "learned (v_B + face swap)",
+                    "v_B_path": v_B_path,
+                    "v_B_train_pn": blob.get("train_pn"),
+                    "v_B_subject_word": blob.get("subject_word"),
+                    "v_B_prompt_t": blob.get("prompt_t"),
+                    "lam_swap": float(lam2),
+                    "e_A_norm": round(e_a_norm, 6),
+                    "cos(e_A,e_B)": round(cos_ab, 6),
                 })
             else:  # linear
-                e_a = self.client.embed_files([src_path])[0]
-                e_a_norm = float(np.linalg.norm(e_a))
-                cos_ab = float(np.dot(e_a, e_b))
-                e_a_t = torch.from_numpy(e_a.astype(np.float32))
                 kv_phase2 = encode_prompt_with_face_op(
                     self.text_tokenizer, self.text_encoder,
                     prompt=prompt_t,
@@ -312,40 +326,57 @@ class FaceSwapApp:
             return b_pil, tgt_pil, info
 
     # ────────────────────────────────────────
-    # Textual Inversion: 訓練 v_A
+    # Textual Inversion: 訓練 v_B (對 B 圖做 inversion)
     # ────────────────────────────────────────
-    def train_v_A(
+    def train_v_B(
         self,
-        source_image: Optional[Image.Image],
         prompt_t: str,
         subject_word: str,
-        identity_name: str,
+        seed: int,
         steps: int,
         lr: float,
         l2_reg: float,
+        train_pn: str,
     ):
-        if source_image is None:
-            raise gr.Error("請先上傳 source face image")
         prompt_t = (prompt_t or "").strip()
         subject_word = (subject_word or "").strip()
-        identity_name = (identity_name or "").strip()
-        if not prompt_t or not subject_word or not identity_name:
-            raise gr.Error("prompt / subject_word / identity_name 都必填")
+        if not prompt_t or not subject_word:
+            raise gr.Error("prompt / subject_word 都必填")
+
+        train_pn = (train_pn or self.args.pn).strip()
+        try:
+            ts_raw = dynamic_resolution_h_w[self.args.h_div_w_template][train_pn]["scales"]
+        except KeyError:
+            raise gr.Error(
+                f"Training pn '{train_pn}' 不支援；可選 '0.25M' / '0.60M' / '1M'"
+            )
+        train_scale_schedule = [(1, h, w) for (_, h, w) in ts_raw]
 
         with self.lock:
-            session_id = uuid.uuid4().hex[:10]
-            stage_dir = os.path.join(self.args.work_dir, f"train_{identity_name}_{session_id}")
-            os.makedirs(stage_dir, exist_ok=True)
-            # 把上傳的圖存進 stage_dir，當成 identity_dir 給 optimize_v_A 讀
-            src_path = os.path.join(stage_dir, "src.png")
-            source_image.convert("RGB").save(src_path)
+            # 1. 拿 B 圖（auto-generate from prompt + seed；已有 cache 會直接用）
+            b_path = self._generate_or_get_B(prompt_t, int(seed))
 
-            # 用一個 namespace 包 args（optimize_v_A 用 args.steps/lr/l2_reg/log_every/seed/apply_spatial_patchify）
+            # 2. 設 stage_dir，把 B 圖 copy / symlink 進去（optimize_v_A 從資料夾讀圖）
+            pt_path = self._v_B_cache_path(prompt_t, int(seed))
+            stage_dir = os.path.join(os.path.dirname(pt_path), "stage")
+            os.makedirs(stage_dir, exist_ok=True)
+            stage_img = os.path.join(stage_dir, os.path.basename(b_path))
+            if os.path.exists(stage_img) or os.path.islink(stage_img):
+                os.remove(stage_img)
+            try:
+                os.symlink(os.path.abspath(b_path), stage_img)
+            except OSError:
+                shutil.copy2(b_path, stage_img)
+
+            # 3. 包 args 給 optimize_v_A（args.steps/lr/l2_reg/log_every/seed/apply_spatial_patchify）
             args_ti = argparse.Namespace(**vars(self.args))
             args_ti.steps = int(steps)
             args_ti.lr = float(lr)
             args_ti.l2_reg = float(l2_reg)
             args_ti.log_every = max(1, int(steps) // 10)
+
+            print(f"[train_v_B] pn={train_pn}  n_scales={len(train_scale_schedule)}  "
+                  f"final={train_scale_schedule[-1]}  B_image={b_path}")
 
             t0 = time.time()
             result = optimize_v_A(
@@ -357,30 +388,46 @@ class FaceSwapApp:
                 identity_dir=stage_dir,
                 prompt_t=prompt_t,
                 subject_word=subject_word,
-                scale_schedule=self.scale_schedule,
+                scale_schedule=train_scale_schedule,
                 args=args_ti,
                 device=self.device_cuda,
             )
             if result is None:
                 raise gr.Error("Textual Inversion 失敗（看 console log 了解原因）")
 
-            pt_path, meta_path = save_v_A_cache(
-                self.args.identity_cache_dir, identity_name, result
-            )
+            # 4. 存 v_B.pt（用 v_B 這個 key，跟 v_A path 區分開）
+            os.makedirs(os.path.dirname(pt_path), exist_ok=True)
+            torch.save({
+                "v_B": result["v_A"],          # optimize_v_A 內部變數叫 v_A，但對 B 圖訓出來就是 v_B
+                "v_init": result["v_init"],
+                "subject_token_indices": result["subject_token_indices"],
+                "subject_word": result["subject_word"],
+                "prompt_t": result["prompt_t"],
+                "seed": int(seed),
+                "train_pn": train_pn,
+                "B_image_path": b_path,
+                "iters": result["iters"],
+                "lr": result["lr"],
+                "l2_reg": result["l2_reg"],
+                "init_loss": result["init_loss"],
+                "final_loss": result["final_loss"],
+            }, pt_path)
             elapsed = time.time() - t0
-            print(f"[train_v_A] saved {pt_path} ({elapsed:.1f}s)")
+            print(f"[train_v_B] saved {pt_path} ({elapsed:.1f}s)")
 
             return {
-                "identity": identity_name,
-                "v_A_path": pt_path,
-                "meta_path": meta_path,
+                "v_B_path": pt_path,
+                "B_image_path": b_path,
+                "prompt_t": prompt_t,
+                "subject_word": subject_word,
+                "seed": int(seed),
+                "train_pn": train_pn,
                 "init_loss": result["init_loss"],
                 "final_loss": result["final_loss"],
                 "iters": result["iters"],
                 "lr": result["lr"],
                 "l2_reg": result["l2_reg"],
                 "elapsed_sec": round(elapsed, 2),
-                "n_images": result["n_images"],
             }
 
 
@@ -393,8 +440,9 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
         gr.Markdown(
             "## Face-Swap (P2P-Edit) — Gradio Demo\n"
             "**Phase 2 兩種模式**：\n"
-            "- **linear**：`new_e_I = λ₁·e_I + λ₂·proj(e_A)`（AdaFace embedding，可能與 Infinity 空間不對齊）\n"
-            "- **learned**：直接用 Textual Inversion 訓練好的 `v_A`（已對齊 Infinity 空間）— 先按 Train v_A"
+            "- **linear**：`new = λ₁·e_I + λ₂·proj(e_A)`（從原始 T5 boy embedding 出發 + AdaFace 投影注入 A）\n"
+            "- **learned (v_B + face swap)**：對 (prompt, seed) 對應的 B 圖做 Textual Inversion 得到 `v_B`，\n"
+            "   推論時做 `v_target = v_B − λ_swap·proj(e_B) + λ_swap·proj(e_A)` — 先按 Train v_B"
         )
         with gr.Row():
             # ── 左欄：輸入 ──
@@ -405,7 +453,7 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
                     lines=2,
                 )
                 source_img = gr.Image(
-                    label="Source face image",
+                    label="Source face image (A)",
                     type="pil",
                     image_mode="RGB",
                     height=320,
@@ -414,24 +462,23 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
                     label="Subject word（要操作的 token，例如 'boy'）",
                     value=app.args.default_subject,
                 )
-                identity_name_box = gr.Textbox(
-                    label="Identity name（learned 模式必填；對應 weights/identities/<name>/）",
-                    value="",
-                    placeholder="例如 smith",
-                )
                 phase2_mode_radio = gr.Radio(
                     choices=["linear", "learned"],
                     value="linear",
                     label="Phase 2 mode",
                 )
                 with gr.Group():
-                    gr.Markdown("**Linear-mode 參數（AdaFace 路徑）**")
+                    gr.Markdown(
+                        "**參數說明**\n"
+                        "- linear 模式：λ₁ = e_I 權重，λ₂ = proj(e_A) 權重\n"
+                        "- learned 模式：**λ₂ = λ_swap**（v_B → v_B + λ_swap·(proj(e_A) − proj(e_B))；λ₁ 不使用）"
+                    )
                     lam1_slider = gr.Slider(
-                        label="λ₁ (e_I weight)", minimum=0.0, maximum=2.0,
+                        label="λ₁ (linear 模式: e_I weight)", minimum=0.0, maximum=2.0,
                         value=0.0, step=0.05,
                     )
                     lam2_slider = gr.Slider(
-                        label="λ₂ (proj(e_A) weight)", minimum=0.0, maximum=2.0,
+                        label="λ₂ (linear: proj(e_A) weight ／ learned: λ_swap)", minimum=0.0, maximum=2.0,
                         value=1.0, step=0.05,
                     )
                 seed_box = gr.Number(
@@ -446,23 +493,32 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
                 info_out = gr.JSON(label="Run info")
 
         # ── Textual Inversion 區塊 ──
-        with gr.Accordion("Train v_A (Textual Inversion)", open=False):
+        with gr.Accordion("Train v_B (Textual Inversion on B image)", open=False):
             gr.Markdown(
-                "對左邊上傳的 source face image 跑 Textual Inversion，\n"
-                "把 prompt 中 subject token 在 Infinity 自身 embedding 空間裡優化成代表這張臉的 `v_A`，\n"
-                "存到 `weights/identities/<identity_name>/v_A.pt`。訓練完將 Phase 2 mode 切成 learned 重跑即可。"
+                "對 (prompt, seed) 自動生成的 base image B 跑 Textual Inversion，\n"
+                "把 prompt 中 subject token 在 Infinity 自身 embedding 空間裡優化成精確代表 B 圖的 `v_B`。\n"
+                "**不需要上傳 source face；只看左邊的 prompt + seed**。\n"
+                "推論時做 `v_target = v_B − λ_swap·proj(e_B) + λ_swap·proj(e_A)`，把 A 的臉 identity 注入 B 的場景。\n"
+                "v_B 依 (prompt, seed) 快取在 `weights/v_B_cache/<hash>/v_B.pt`，相同 (prompt, seed) 重訓會覆寫。\n\n"
+                "**Training pn**：訓練解析度，越低 VRAM/速度越省（v_B 是 2048-d 文字嵌入，與推論解析度無關，"
+                "於 0.25M 訓出的 v_B 仍可在 1M 推論使用）。"
             )
             with gr.Row():
+                ti_train_pn = gr.Radio(
+                    choices=["0.25M", "0.60M", "1M"],
+                    value="0.25M",
+                    label="Training pn",
+                )
                 ti_steps = gr.Slider(
-                    label="steps", minimum=20, maximum=500, value=150, step=10,
+                    label="steps", minimum=20, maximum=500, value=80, step=10,
                 )
                 ti_lr = gr.Slider(
                     label="learning rate", minimum=1e-4, maximum=5e-3, value=1e-3, step=1e-4,
                 )
                 ti_l2 = gr.Slider(
-                    label="L2 reg ||v_A−v_init||²", minimum=0.0, maximum=1e-2, value=1e-4, step=1e-4,
+                    label="L2 reg ||v_B−v_init||²", minimum=0.0, maximum=1e-2, value=1e-4, step=1e-4,
                 )
-            train_btn = gr.Button("Train v_A on this face", variant="secondary")
+            train_btn = gr.Button("Train v_B for current (prompt, seed)", variant="secondary")
             train_info_out = gr.JSON(label="Training result")
 
         # ── 事件繫結 ──
@@ -472,15 +528,15 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
                 prompt_box, source_img,
                 lam1_slider, lam2_slider,
                 subject_box, seed_box,
-                phase2_mode_radio, identity_name_box,
+                phase2_mode_radio,
             ],
             outputs=[b_out, tgt_out, info_out],
         )
         train_btn.click(
-            fn=app.train_v_A,
+            fn=app.train_v_B,
             inputs=[
-                source_img, prompt_box, subject_box, identity_name_box,
-                ti_steps, ti_lr, ti_l2,
+                prompt_box, subject_box, seed_box,
+                ti_steps, ti_lr, ti_l2, ti_train_pn,
             ],
             outputs=[train_info_out],
         )
@@ -503,7 +559,10 @@ def main() -> None:
     parser.add_argument("--work_dir", type=str, default="./outputs/gradio_face_swap")
     parser.add_argument("--adaface_url", type=str, default="http://127.0.0.1:8000")
     parser.add_argument("--identity_cache_dir", type=str, default="./weights/identities",
-                        help="存放 v_A.pt 的目錄；Train 按鈕寫入這裡，learned 模式從這裡讀")
+                        help="存放 v_A.pt 的目錄（保留供舊 v_A 流程；新流程未使用）")
+    parser.add_argument("--v_B_cache_dir", type=str, default="./weights/v_B_cache",
+                        help="存放 v_B.pt 的目錄；Train v_B 寫入這裡，learned 模式從這裡讀，"
+                             "key = hash(prompt, seed)")
 
     # Face-swap 預設值
     parser.add_argument("--default_prompt", type=str, default=DEFAULT_PROMPT)
@@ -539,6 +598,7 @@ def main() -> None:
     print("=" * 80)
     print(f"work_dir       : {args.work_dir}")
     print(f"adaface_url    : {args.adaface_url}")
+    print(f"v_B_cache_dir  : {args.v_B_cache_dir}")
     print(f"default_prompt : {args.default_prompt}")
     print(f"server         : {args.host}:{args.port}  share={bool(args.share)}")
     print("=" * 80 + "\n")
