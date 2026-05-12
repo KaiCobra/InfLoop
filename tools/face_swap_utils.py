@@ -308,20 +308,96 @@ def apply_v_B_with_face_swap(
     return out
 
 
+def apply_resampler_to_text_features(
+    text_features: torch.Tensor,         # [1, L, 2048]  T5 last_hidden_state
+    token_indices: List[int],
+    resampler_output: torch.Tensor,      # [1, n_tokens, 2048] from IDResampler
+    mix_alpha: float = 1.0,
+    match_orig_norm: bool = False,
+    verbose: bool = False,
+) -> torch.Tensor:
+    """把 IDResampler 輸出的 N 個 token 寫入 T5 output 中 subject token 對應位置。
+
+    支援的對應方式：
+      • n_tokens == 1：把這一個 token 廣播到所有 subject sub-token 位置
+      • n_tokens == len(token_indices)：一對一替換
+      • 其他：raise
+
+    額外控制：
+      mix_alpha       : out[idx] = (1-α) * orig[idx] + α * src   （α=1 全替換）
+      match_orig_norm : 把 src 先 rescale 到 ||orig[idx]||（保留方向、norm 對齊）
+
+    回傳 cloned tensor（input 不會被原地修改）。
+    """
+    if not token_indices:
+        return text_features.clone()
+    if resampler_output.dim() != 3:
+        raise ValueError(
+            f"resampler_output must be 3-d (B, N, t5), got shape {tuple(resampler_output.shape)}"
+        )
+    if resampler_output.size(0) != 1:
+        raise ValueError(
+            f"resampler_output batch must be 1 (single prompt path), "
+            f"got {resampler_output.size(0)}"
+        )
+    if resampler_output.shape[-1] != text_features.shape[-1]:
+        raise ValueError(
+            f"resampler_output last dim {resampler_output.shape[-1]} != "
+            f"text_features last dim {text_features.shape[-1]}"
+        )
+
+    out = text_features.clone()
+    r = resampler_output.to(out.dtype).to(out.device)
+    n_tokens = r.shape[1]
+    n_sub = len(token_indices)
+    alpha = float(mix_alpha)
+    eps = 1e-8
+
+    def _src_for(k_idx, target_idx):
+        src = r[0, 0 if n_tokens == 1 else k_idx, :]
+        if match_orig_norm:
+            target_norm = out[0, target_idx, :].norm(p=2).clamp_min(eps)
+            src = src / src.norm(p=2).clamp_min(eps) * target_norm
+        return src
+
+    if n_tokens == 1 or n_tokens == n_sub:
+        for k, idx in enumerate(token_indices):
+            src = _src_for(k, idx)
+            new_vec = (1.0 - alpha) * out[0, idx, :] + alpha * src
+            if verbose:
+                orig_norm = float(out[0, idx, :].norm(p=2).item())
+                new_norm = float(new_vec.norm(p=2).item())
+                print(
+                    f"    [resampler] token[{idx}]  alpha={alpha:.3f} "
+                    f"match_norm={match_orig_norm}  orig_norm={orig_norm:.3f} "
+                    f"new_norm={new_norm:.3f}"
+                )
+            out[0, idx, :] = new_vec
+    else:
+        raise ValueError(
+            f"resampler n_tokens={n_tokens} 必須是 1（廣播）或 len(token_indices)={n_sub}（一對一）"
+        )
+    return out
+
+
 def encode_prompt_with_face_op(
     text_tokenizer,
     text_encoder,
     prompt: str,
     face_emb_512: Optional[torch.Tensor] = None,
-    op_mode: Optional[str] = None,        # None / "subtract" / "replace" / "linear" / "learned" / "v_B_swap"
+    op_mode: Optional[str] = None,        # None / "subtract" / "replace" / "linear" / "learned" / "v_B_swap" / "resampler"
     subject_token_indices: Optional[List[int]] = None,
     lam1: float = 0.0,
     lam2: float = 1.0,
     learned_v_A: Optional[torch.Tensor] = None,  # 僅當 op_mode="learned" 時使用
     learned_v_B: Optional[torch.Tensor] = None,  # 僅當 op_mode="v_B_swap" 時使用
-    face_emb_e_A: Optional[torch.Tensor] = None, # 僅當 op_mode="v_B_swap" 時使用 (512-d)
+    face_emb_e_A: Optional[torch.Tensor] = None, # op_mode="v_B_swap" / "resampler" 時使用 (512-d)
     face_emb_e_B: Optional[torch.Tensor] = None, # 僅當 op_mode="v_B_swap" 時使用 (512-d)
     lam_swap: float = 1.0,                       # 僅當 op_mode="v_B_swap" 時使用
+    resampler: Optional[torch.nn.Module] = None, # 僅當 op_mode="resampler" 時使用 (IDResampler)
+    resampler_no_grad: bool = True,              # inference 時 True；訓練 Resampler 時設 False
+    resampler_mix_alpha: float = 1.0,            # op_mode="resampler" 時的 lambda mixing
+    resampler_match_orig_norm: bool = False,     # op_mode="resampler" 時是否把 src 對齊原 token norm
     verbose: bool = False,
 ) -> Tuple[torch.Tensor, List[int], torch.Tensor, int]:
     """encode_prompt 的延伸版：在 trim padding 前對 subject token 做面部 embedding 操作。
@@ -329,13 +405,18 @@ def encode_prompt_with_face_op(
     Args:
         prompt:   原始 prompt 字串
         face_emb_512: 512-d AdaFace embedding；op_mode in {subtract, replace, linear} 時使用
-        op_mode:  "subtract" / "replace" / "linear" / "learned" / "v_B_swap" / None
+        op_mode:  "subtract" / "replace" / "linear" / "learned" / "v_B_swap" / "resampler" / None
         subject_token_indices: 透過 find_focus_token_indices 預先算好的 token 索引
         lam1, lam2: 僅當 op_mode="linear" 時使用，組合成 lam1*orig + lam2*proj_scaled
         learned_v_A: 形狀 [k, 2048] 或 [2048]，op_mode="learned" 時使用；
                      直接寫入 subject token 位置（不做 repeat-4 / norm-scale）
         learned_v_B / face_emb_e_A / face_emb_e_B / lam_swap:
                      op_mode="v_B_swap" 時使用，做 v_B − proj(e_B) + proj(e_A) 注入
+        resampler / face_emb_e_A:
+                     op_mode="resampler" 時使用：先跑 T5 拿 last_hidden_state，再用
+                     IDResampler(face_emb_e_A, prompt_ctx=last_hidden_state) 產出 N 個
+                     2048-d token 覆蓋 subject token 位置（output 端替換）。
+        resampler_no_grad: inference 時 True；訓練 Resampler 時應設 False 讓梯度回傳。
 
     Returns:
         (kv_compact, lens, cu_seqlens_k, Ltext) — 與 run_p2p_edit.encode_prompt 相同 shape
@@ -355,7 +436,49 @@ def encode_prompt_with_face_op(
         input_ids=input_ids, attention_mask=mask
     )["last_hidden_state"].float()                     # [1, 512, 2048]
 
-    if op_mode == "v_B_swap":
+    if op_mode == "resampler":
+        if resampler is None:
+            raise ValueError(
+                "op_mode='resampler' requires `resampler` (IDResampler module)"
+            )
+        if face_emb_e_A is None:
+            raise ValueError(
+                "op_mode='resampler' requires `face_emb_e_A` (512-d AdaFace)"
+            )
+        if not subject_token_indices:
+            raise ValueError(
+                "subject_token_indices must be non-empty for op_mode='resampler'"
+            )
+
+        # Resampler 跑在 text_features 同 device、float32（穩定度），最後再 cast 回去寫入
+        target_device = text_features.device
+        e_a_dev = face_emb_e_A.detach().to(torch.float32).to(target_device)
+        if e_a_dev.dim() == 1:
+            e_a_dev = e_a_dev.unsqueeze(0)                                  # (1, 512)
+
+        # use_prompt_ctx: 把 T5 last_hidden_state（pre-replacement 的乾淨版）
+        # 當 cross-attn 的 prompt context；mask 從 tokenizer attention_mask 取
+        use_prompt_ctx = bool(getattr(resampler, "use_prompt_ctx", False))
+        prompt_ctx_in = text_features.float() if use_prompt_ctx else None    # (1, L, 2048)
+        prompt_mask_in = mask.bool() if use_prompt_ctx else None             # (1, L)
+
+        ctx_mgr = torch.no_grad() if resampler_no_grad else torch.enable_grad()
+        with ctx_mgr:
+            resampler_out = resampler(
+                id_feat=e_a_dev,
+                prompt_ctx=prompt_ctx_in,
+                prompt_mask=prompt_mask_in,
+            )                                                                # (1, n_tokens, 2048)
+
+        text_features = apply_resampler_to_text_features(
+            text_features=text_features,
+            token_indices=subject_token_indices,
+            resampler_output=resampler_out,
+            mix_alpha=float(resampler_mix_alpha),
+            match_orig_norm=bool(resampler_match_orig_norm),
+            verbose=verbose,
+        )
+    elif op_mode == "v_B_swap":
         if learned_v_B is None or face_emb_e_A is None or face_emb_e_B is None:
             raise ValueError(
                 "op_mode='v_B_swap' requires learned_v_B, face_emb_e_A, face_emb_e_B"

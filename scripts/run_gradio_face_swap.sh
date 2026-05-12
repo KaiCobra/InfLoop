@@ -71,6 +71,18 @@ identity_cache_dir="./weights/identities"   # 保留：舊 v_A 流程（目前 U
 v_B_cache_dir="./weights/v_B_cache"         # learned 模式從這裡讀 v_B.pt；Train v_B 也寫到這
 debug_face_op=0
 
+# ── IDResampler（output 端替換）──
+# AdaFace 512 → N 個 t5-output token，覆蓋 prompt 過 T5 後 subject token 對應位置。
+# resampler_ckpt 留空或檔不存在 → 用初始權重（output ≈ anchor word，face swap 效果有限）。
+# 訓練 Resampler 後把 state_dict 存到這個路徑即可載入。
+resampler_ckpt="./weights/id_resampler/resampler.pt"
+resampler_n_tokens=1
+resampler_n_id_ctx=4
+resampler_n_layers=2
+resampler_n_heads=8
+resampler_use_prompt_ctx=1
+resampler_anchor_word="person"
+
 mkdir -p "${work_dir}"
 
 echo "================================================================"
@@ -123,4 +135,11 @@ python3 tools/gradio_face_swap.py \
   --v_B_cache_dir "${v_B_cache_dir}" \
   --default_prompt "${default_prompt}" \
   --default_subject "${default_subject}" \
-  --debug_face_op ${debug_face_op}
+  --debug_face_op ${debug_face_op} \
+  --resampler_ckpt "${resampler_ckpt}" \
+  --resampler_n_tokens ${resampler_n_tokens} \
+  --resampler_n_id_ctx ${resampler_n_id_ctx} \
+  --resampler_n_layers ${resampler_n_layers} \
+  --resampler_n_heads ${resampler_n_heads} \
+  --resampler_use_prompt_ctx ${resampler_use_prompt_ctx} \
+  --resampler_anchor_word "${resampler_anchor_word}"

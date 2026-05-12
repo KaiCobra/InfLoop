@@ -56,6 +56,7 @@ from tools.optimize_face_token import (  # noqa: E402
     optimize_v_A,
     save_v_A_cache,
 )
+from tools.id_resampler import IDResampler, get_anchor_t5_embedding  # noqa: E402
 from infinity.utils.dynamic_resolution import dynamic_resolution_h_w  # noqa: E402
 
 
@@ -102,9 +103,70 @@ class FaceSwapApp:
         # BitwiseSelfCorrection（textual inversion 用）
         self.bsc = build_bsc(self.vae, args)
 
+        # IDResampler：AdaFace 512 → N 個 T5 output token，做 output 端替換
+        self.resampler = self._build_resampler(args)
+
         os.makedirs(args.work_dir, exist_ok=True)
         os.makedirs(args.identity_cache_dir, exist_ok=True)
         os.makedirs(args.v_B_cache_dir, exist_ok=True)
+
+    # ────────────────────────────────────────
+    # IDResampler 建構：anchor 從 T5 拿 args.resampler_anchor_word；
+    # 若有 args.resampler_ckpt 且檔存在 → 載入 state_dict
+    # ────────────────────────────────────────
+    def _build_resampler(self, args) -> IDResampler:
+        anchor_word = (args.resampler_anchor_word or "person").strip()
+        try:
+            anchor_emb = get_anchor_t5_embedding(
+                self.text_tokenizer,
+                self.text_encoder,
+                anchor_phrase=f"a {anchor_word}",
+                target_word=anchor_word,
+            )
+            print(f"[Resampler] anchor word='{anchor_word}' "
+                  f"emb_norm={float(anchor_emb.norm()):.3f}")
+        except Exception as exc:
+            print(f"[Resampler] ⚠ failed to derive anchor for '{anchor_word}': {exc}")
+            print("           anchor 改用 zero vector（殘差初始 ≈ 0）")
+            anchor_emb = torch.zeros(int(args.text_channels))
+
+        resampler = IDResampler(
+            id_dim=512,
+            t5_dim=int(args.text_channels),
+            n_tokens=int(args.resampler_n_tokens),
+            n_id_ctx=int(args.resampler_n_id_ctx),
+            n_layers=int(args.resampler_n_layers),
+            n_heads=int(args.resampler_n_heads),
+            use_prompt_ctx=bool(args.resampler_use_prompt_ctx),
+            anchor_emb=anchor_emb,
+        )
+
+        ckpt = (args.resampler_ckpt or "").strip()
+        if ckpt and os.path.exists(ckpt):
+            try:
+                state = torch.load(ckpt, map_location="cpu", weights_only=False)
+                if isinstance(state, dict) and "state_dict" in state:
+                    state = state["state_dict"]
+                missing, unexpected = resampler.load_state_dict(state, strict=False)
+                print(f"[Resampler] loaded ckpt '{ckpt}' "
+                      f"(missing={len(missing)} unexpected={len(unexpected)})")
+            except Exception as exc:
+                print(f"[Resampler] ⚠ failed to load ckpt '{ckpt}': {exc}")
+                print("           Resampler 維持 anchor + small-delta 初始狀態")
+        else:
+            if ckpt:
+                print(f"[Resampler] ⚠ ckpt path '{ckpt}' 不存在；用初始權重")
+            else:
+                print("[Resampler] no ckpt path supplied; 用初始權重 "
+                      "（未訓練 → output ≈ anchor，face swap 效果有限）")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        resampler = resampler.to(device).eval()
+        n_params = sum(p.numel() for p in resampler.parameters())
+        print(f"[Resampler] device={device}  params={n_params/1e6:.2f}M  "
+              f"n_tokens={resampler.n_tokens}  n_id_ctx={resampler.n_id_ctx}  "
+              f"use_prompt_ctx={resampler.use_prompt_ctx}")
+        return resampler
 
     # ────────────────────────────────────────
     # v_B 快取：(prompt, seed) → weights/v_B_cache/<hash>/v_B.pt
@@ -232,7 +294,28 @@ class FaceSwapApp:
             e_a_t = torch.from_numpy(e_a.astype(np.float32))
 
             extra_info = {}
-            if phase2_mode == "learned":
+            if phase2_mode == "resampler":
+                # IDResampler：AdaFace e_A → N 個 t5-output token，覆蓋 subject token 位置
+                kv_phase2 = encode_prompt_with_face_op(
+                    self.text_tokenizer, self.text_encoder,
+                    prompt=prompt_t,
+                    op_mode="resampler",
+                    subject_token_indices=subject_token_indices,
+                    face_emb_e_A=e_a_t,
+                    resampler=self.resampler,
+                    resampler_no_grad=True,
+                    verbose=bool(self.args.debug_face_op),
+                )
+                extra_info.update({
+                    "phase2_mode": "resampler (output-side replacement)",
+                    "resampler_n_tokens": int(self.resampler.n_tokens),
+                    "resampler_n_id_ctx": int(self.resampler.n_id_ctx),
+                    "resampler_use_prompt_ctx": bool(self.resampler.use_prompt_ctx),
+                    "resampler_ckpt": self.args.resampler_ckpt or "(uninitialized)",
+                    "e_A_norm": round(e_a_norm, 6),
+                    "cos(e_A,e_B)": round(cos_ab, 6),
+                })
+            elif phase2_mode == "learned":
                 # v_B + face swap：v_target = v_B - lam_swap * proj(e_B) + lam_swap * proj(e_A)
                 v_B_path = self._v_B_cache_path(prompt_t, int(seed))
                 if not os.path.exists(v_B_path):
@@ -439,10 +522,12 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
     with gr.Blocks(title="Face-Swap (P2P-Edit) Demo") as demo:
         gr.Markdown(
             "## Face-Swap (P2P-Edit) — Gradio Demo\n"
-            "**Phase 2 兩種模式**：\n"
+            "**Phase 2 三種模式**：\n"
             "- **linear**：`new = λ₁·e_I + λ₂·proj(e_A)`（從原始 T5 boy embedding 出發 + AdaFace 投影注入 A）\n"
             "- **learned (v_B + face swap)**：對 (prompt, seed) 對應的 B 圖做 Textual Inversion 得到 `v_B`，\n"
-            "   推論時做 `v_target = v_B − λ_swap·proj(e_B) + λ_swap·proj(e_A)` — 先按 Train v_B"
+            "   推論時做 `v_target = v_B − λ_swap·proj(e_B) + λ_swap·proj(e_A)` — 先按 Train v_B\n"
+            "- **resampler**：AdaFace e_A 過 attention-based MLP（IDResampler）→ N 個 token 直接覆蓋 T5 "
+            "  output 對應 subject 位置（output 端替換）。未訓練時 ≈ anchor word（預設 'person'）。"
         )
         with gr.Row():
             # ── 左欄：輸入 ──
@@ -463,7 +548,7 @@ def build_ui(app: FaceSwapApp) -> gr.Blocks:
                     value=app.args.default_subject,
                 )
                 phase2_mode_radio = gr.Radio(
-                    choices=["linear", "learned"],
+                    choices=["linear", "learned", "resampler"],
                     value="linear",
                     label="Phase 2 mode",
                 )
@@ -568,6 +653,21 @@ def main() -> None:
     parser.add_argument("--default_prompt", type=str, default=DEFAULT_PROMPT)
     parser.add_argument("--default_subject", type=str, default="boy")
     parser.add_argument("--debug_face_op", type=int, default=0, choices=[0, 1])
+
+    # IDResampler（AdaFace 512 → N 個 t5-output token，做 output 端替換）
+    parser.add_argument("--resampler_ckpt", type=str, default="",
+                        help="IDResampler 權重檔；為空或檔不存在 → 用初始權重（output ≈ anchor）")
+    parser.add_argument("--resampler_n_tokens", type=int, default=1,
+                        help="輸出 token 數；1=廣播到所有 subject sub-token，"
+                             "或 = subject 子詞數做一對一替換")
+    parser.add_argument("--resampler_n_id_ctx", type=int, default=4,
+                        help="把 AdaFace 512 投影成幾個 t5_dim context token（做 cross-attn）")
+    parser.add_argument("--resampler_n_layers", type=int, default=2)
+    parser.add_argument("--resampler_n_heads", type=int, default=8)
+    parser.add_argument("--resampler_use_prompt_ctx", type=int, default=1, choices=[0, 1],
+                        help="cross-attn 是否額外吃 T5(prompt) last_hidden_state 當 context")
+    parser.add_argument("--resampler_anchor_word", type=str, default="person",
+                        help="anchor 初始化用的詞；殘差到該詞的 T5 output embedding")
 
     # P2P-Edit 設定（與 batch_run_pie_edit_faceSwap 對齊）
     parser.add_argument("--num_full_replace_scales", type=int, default=2)

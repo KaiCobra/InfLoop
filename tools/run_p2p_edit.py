@@ -1673,6 +1673,23 @@ if __name__ == '__main__':
                         help='Method 14 focus 閾值（正規化後 >= absolute_high 為 focus）。預設：0.7')
     parser.add_argument('--absolute_low', type=float, default=0.3,
                         help='Method 14 preserve 閾值（正規化後 < absolute_low 為 preserve）。預設：0.3')
+    parser.add_argument('--cv_min', type=float, default=0.0,
+                        help='Method 13 (Meta-Adaptive) CV 變異係數下界。預設：0.0')
+    parser.add_argument('--cv_max', type=float, default=1.0,
+                        help='Method 13 (Meta-Adaptive) CV 變異係數上界。預設：1.0')
+    parser.add_argument('--k_min', type=float, default=0.2,
+                        help='Method 13 (Meta-Adaptive) k 倍率下界。預設：0.2')
+    parser.add_argument('--k_max', type=float, default=0.5,
+                        help='Method 13 (Meta-Adaptive) k 倍率上界。預設：0.5')
+    parser.add_argument('--use_last_scale_mask', type=int, default=0, choices=[0, 1],
+                        help='僅從最後一個 scale 提取 attention mask，再向前逐步推導各 scale（0=停用，1=啟用）')
+    parser.add_argument('--last_scale_majority_threshold', type=float, default=0.5,
+                        help='Last-scale mask 向前推導時的多數投票閾值（預設 0.5 = 50%%）')
+    parser.add_argument('--use_dynamic_threshold', type=int, default=0, choices=[0, 1],
+                        help='使用 dynamic ternary search 搜尋閾值（需提供 ref mask；'
+                             '單張推論模式無 GT mask 時自動退回固定 percentile）')
+    parser.add_argument('--dynamic_threshold_iters', type=int, default=20,
+                        help='Dynamic threshold ternary search 最大迭代次數（預設 20）')
     parser.add_argument('--phase17_fallback_replace_scales', type=int, default=4,
                         help='Single-focus fallback（只有 target focus）時，'
                              'Phase 1.7 以 source gen token 替換前幾個 scale（0=停用）。預設：4')
@@ -1887,52 +1904,68 @@ if __name__ == '__main__':
     source_text_masks: Dict[int, np.ndarray] = {}
     source_low_attn_masks: Dict[int, np.ndarray] = {}
     source_keep_masks: Dict[int, np.ndarray] = {}
-    if source_focus_token_indices and len(source_extractor.attention_maps) > 0:
-        source_text_masks = collect_attention_text_masks(
+
+    use_last_scale = bool(getattr(args, 'use_last_scale_mask', 0))
+    last_scale_majority = float(getattr(args, 'last_scale_majority_threshold', 0.5))
+    abs_high = float(getattr(args, 'absolute_high', 0.7))
+    abs_low = float(getattr(args, 'absolute_low', 0.3))
+    cv_min_v = float(getattr(args, 'cv_min', 0.0))
+    cv_max_v = float(getattr(args, 'cv_max', 1.0))
+    k_min_v = float(getattr(args, 'k_min', 0.2))
+    k_max_v = float(getattr(args, 'k_max', 0.5))
+
+    if bool(getattr(args, 'use_dynamic_threshold', 0)):
+        print("⚠️  use_dynamic_threshold=1 但單張推論模式無 GT ref mask，將退回固定 percentile。")
+
+    def _collect_masks(focus_indices, label, low_attn):
+        if use_last_scale:
+            return collect_last_scale_attention_mask(
+                extractor=source_extractor,
+                focus_token_indices=focus_indices,
+                scale_schedule=scale_schedule,
+                start_scale=args.num_full_replace_scales,
+                attn_block_indices=attn_block_indices,
+                threshold_percentile=args.attn_threshold_percentile,
+                label=label,
+                low_attn=low_attn,
+                use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                majority_threshold=last_scale_majority,
+                threshold_method=args.threshold_method,
+                source_image_np=source_image_np_for_threshold,
+            )
+        return collect_attention_text_masks(
             extractor=source_extractor,
-            focus_token_indices=source_focus_token_indices,
+            focus_token_indices=focus_indices,
             scale_schedule=scale_schedule,
             num_full_replace_scales=args.num_full_replace_scales,
             attn_block_indices=attn_block_indices,
             threshold_percentile=args.attn_threshold_percentile,
-            label="source",
-            low_attn=False,
+            label=label,
+            low_attn=low_attn,
+            use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
             threshold_method=args.threshold_method,
             source_image_np=source_image_np_for_threshold,
+            cv_min=cv_min_v,
+            cv_max=cv_max_v,
+            k_min=k_min_v,
+            k_max=k_max_v,
+            absolute_high=abs_high,
+            absolute_low=abs_low,
         )
+
+    if source_focus_token_indices and len(source_extractor.attention_maps) > 0:
+        source_text_masks = _collect_masks(source_focus_token_indices, "source", False)
         print(f"✓ Source focus mask：{len(source_text_masks)} 個 scale")
 
         # 同一組 source attention，取最低 (100-percentile)% 作為 Phase 1.7 的 preserve 區域
-        source_low_attn_masks = collect_attention_text_masks(
-            extractor=source_extractor,
-            focus_token_indices=source_focus_token_indices,
-            scale_schedule=scale_schedule,
-            num_full_replace_scales=args.num_full_replace_scales,
-            attn_block_indices=attn_block_indices,
-            threshold_percentile=args.attn_threshold_percentile,
-            label="source_preserve",
-            low_attn=True,
-            threshold_method=args.threshold_method,
-            source_image_np=source_image_np_for_threshold,
-        )
+        source_low_attn_masks = _collect_masks(source_focus_token_indices, "source_preserve", True)
         print(f"✓ Source low-attention preserve mask：{len(source_low_attn_masks)} 個 scale")
     else:
         print("⚠️  無 source attention map 可用。")
 
     # source_keep_words：高 attention 區域 → 保留 source gen token（與 focus 邏輯相反）
     if source_keep_token_indices and len(source_extractor.attention_maps) > 0:
-        source_keep_masks = collect_attention_text_masks(
-            extractor=source_extractor,
-            focus_token_indices=source_keep_token_indices,
-            scale_schedule=scale_schedule,
-            num_full_replace_scales=args.num_full_replace_scales,
-            attn_block_indices=attn_block_indices,
-            threshold_percentile=args.attn_threshold_percentile,
-            label="source_keep",
-            low_attn=False,  # 高 attention = keep 區域
-            threshold_method=args.threshold_method,
-            source_image_np=source_image_np_for_threshold,
-        )
+        source_keep_masks = _collect_masks(source_keep_token_indices, "source_keep", False)
         print(f"✓ Source keep mask：{len(source_keep_masks)} 個 scale")
     else:
         if source_keep_words_list:
@@ -2068,17 +2101,40 @@ if __name__ == '__main__':
         target_extractor.remove_patches()
         target_extractor.get_summary()
 
-        target_text_masks = collect_attention_text_masks(
-            extractor=target_extractor,
-            focus_token_indices=target_focus_token_indices,
-            scale_schedule=scale_schedule,
-            num_full_replace_scales=args.num_full_replace_scales,
-            attn_block_indices=attn_block_indices,
-            threshold_percentile=args.attn_threshold_percentile,
-            label="target",
-            threshold_method=args.threshold_method,
-            source_image_np=source_image_np_for_threshold,
-        )
+        if use_last_scale:
+            target_text_masks = collect_last_scale_attention_mask(
+                extractor=target_extractor,
+                focus_token_indices=target_focus_token_indices,
+                scale_schedule=scale_schedule,
+                start_scale=args.num_full_replace_scales,
+                attn_block_indices=attn_block_indices,
+                threshold_percentile=args.attn_threshold_percentile,
+                label="target",
+                low_attn=False,
+                use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                majority_threshold=last_scale_majority,
+                threshold_method=args.threshold_method,
+                source_image_np=source_image_np_for_threshold,
+            )
+        else:
+            target_text_masks = collect_attention_text_masks(
+                extractor=target_extractor,
+                focus_token_indices=target_focus_token_indices,
+                scale_schedule=scale_schedule,
+                num_full_replace_scales=args.num_full_replace_scales,
+                attn_block_indices=attn_block_indices,
+                threshold_percentile=args.attn_threshold_percentile,
+                label="target",
+                use_normalized_attn=bool(getattr(args, 'use_normalized_attn', 0)),
+                threshold_method=args.threshold_method,
+                source_image_np=source_image_np_for_threshold,
+                cv_min=cv_min_v,
+                cv_max=cv_max_v,
+                k_min=k_min_v,
+                k_max=k_max_v,
+                absolute_high=abs_high,
+                absolute_low=abs_low,
+            )
         print(f"✓ Target focus mask：{len(target_text_masks)} 個 scale")
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
